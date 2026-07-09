@@ -63,8 +63,24 @@ namespace cupanutils {
                                                                                                  const float3& camera_position) {
       const dim3 threads_per_block((n_threads * n_threads), 1);
       int stream_size = container_->total_size_;
-      const dim3 n_blocks(stream_size / threads_per_block.x, 1);
+      const dim3 n_blocks((stream_size + threads_per_block.x - 1) / threads_per_block.x, 1);
       int start_idx = 0;
+
+      if (stream_size > 0) {
+        integrateFromGlobalHashPass1Kernel<<<n_blocks, threads_per_block>>>(
+          radius, camera_position, start_idx, d_SDF_block_counter_, d_SDFBlockDescOutput_, container_->d_instance_);
+        CUDA_CHECK(cudaDeviceSynchronize());
+      }
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrateFromGlobalHashPass1(const float radius,
+                                                                                                 const float3& camera_position,
+                                                                                                 const int num_pass) {
+      const dim3 threads_per_block((n_threads * n_threads), 1);
+      int stream_size = max_num_sdf_block_integrate_from_global_hash_;
+      const dim3 n_blocks((stream_size + threads_per_block.x - 1) / threads_per_block.x, 1);
+      int start_idx = num_pass * max_num_sdf_block_integrate_from_global_hash_;
 
       if (stream_size > 0) {
         integrateFromGlobalHashPass1Kernel<<<n_blocks, threads_per_block>>>(

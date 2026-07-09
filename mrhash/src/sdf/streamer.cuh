@@ -212,6 +212,7 @@ namespace cupanutils {
       // ! stream out - to host
       void streamOutToHostPass0(const float3& camera_pose, const float radius);
       void integrateFromGlobalHashPass1(const float radius, const float3& camera_position);
+      void integrateFromGlobalHashPass1(const float radius, const float3& camera_position, const int num_pass);
       void integrateFromGlobalHashPass2(const uint num_SDF_block_desc);
 
       void streamAllOut(); // usually at the end

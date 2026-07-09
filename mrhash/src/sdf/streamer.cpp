@@ -168,41 +168,30 @@ namespace cupanutils {
     template <typename T>
     void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::streamOutToHostPass0(const float3& camera_position,
                                                                                          const float radius) {
-      container_->resetHashBucketMutex();
-      clearSDFBlockCounter();
+      const uint num_pass = (container_->total_size_ + max_num_sdf_block_integrate_from_global_hash_ - 1) /
+                            max_num_sdf_block_integrate_from_global_hash_;
+      uint streamed_out_blocks = 0;
+      for (int pass = 0; pass < num_pass; ++pass) {
+        container_->resetHashBucketMutex();
+        clearSDFBlockCounter();
+        integrateFromGlobalHashPass1(radius, camera_position, pass);
+        curr_stream_out_blocks_ = getSDFBlockCounter();
 
-      //-------------------------------------------------------
-      // Pass 1: Find all SDFBlocks that have to be transfered
-      //-------------------------------------------------------
+        if (curr_stream_out_blocks_ > 0) {
+          integrateFromGlobalHashPass2(curr_stream_out_blocks_, pass);
 
-      integrateFromGlobalHashPass1(radius, camera_position);
-
-      const uint n_sdf_block_descs = getSDFBlockCounter();
-      if (n_sdf_block_descs >= max_num_sdf_block_integrate_from_global_hash_) {
-        std::cerr << "streamOutToHostPass0 | sdf block to stream out: " << n_sdf_block_descs
-                  << " | current capacity: " << max_num_sdf_block_integrate_from_global_hash_ << std::endl;
-        throw std::runtime_error("not enough memory allocated for intermediate GPU buffer (wants to stream out more block than "
-                                 "increase max_num_sdf_block_integrate_from_global_hash");
+          const int stream_size = curr_stream_out_blocks_;
+          CUDA_CHECK(cudaMemcpy(
+            &h_SDFBlockDescOutput_[0], &d_SDFBlockDescOutput_[0], sizeof(SDFBlockDesc) * stream_size, cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(&h_SDFBlockOutput_[0],
+                                &d_SDFBlockOutput_[0],
+                                sizeof(T) * container_->voxel_block_volume_ * stream_size,
+                                cudaMemcpyDeviceToHost));
+          integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
+          streamed_out_blocks += curr_stream_out_blocks_;
+        }
       }
-
-      if (n_sdf_block_descs > 0) {
-        // std::cerr << "SDFBlocks streamed out: " << n_sdf_block_descs << std::endl;
-
-        //-------------------------------------------------------
-        // Pass 2: Copy SDFBlocks to output buffer
-        //-------------------------------------------------------
-        integrateFromGlobalHashPass2(n_sdf_block_descs);
-
-        const int stream_size = n_sdf_block_descs;
-        CUDA_CHECK(cudaMemcpy(
-          &h_SDFBlockDescOutput_[0], &d_SDFBlockDescOutput_[0], sizeof(SDFBlockDesc) * stream_size, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&h_SDFBlockOutput_[0],
-                              &d_SDFBlockOutput_[0],
-                              sizeof(T) * container_->voxel_block_volume_ * stream_size,
-                              cudaMemcpyDeviceToHost));
-      }
-
-      curr_stream_out_blocks_ = n_sdf_block_descs;
+      curr_stream_out_blocks_ = streamed_out_blocks;
     }
 
     template <typename T>
@@ -346,7 +335,6 @@ namespace cupanutils {
         CUDA_CHECK(cudaEventRecord(stop_event_, 0));
         CUDA_CHECK(cudaEventSynchronize(stop_event_));
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start_event_, stop_event_));
-        streamOutToCPUPass1CPU();
 
         // stream - in in GPU
         streamInToGPU(camera_position, radius);
