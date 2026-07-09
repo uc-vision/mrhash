@@ -196,6 +196,7 @@ namespace cupanutils {
                      const CUDAVectorf& weights,
                      const Camera& camera,
                      const int max_num_frames);
+      __host__ Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> surfaceVoxels(float surface_band);
       __host__ void garbageCollect(const Camera& camera, const int max_num_frames);
 
       // some internal methods

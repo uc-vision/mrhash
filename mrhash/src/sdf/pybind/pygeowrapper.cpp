@@ -47,6 +47,7 @@ NB_MODULE(pygeowrapper, m) {
     .def("getVertices", &GeoWrapper::getVertices)
     .def("getFaces", &GeoWrapper::getFaces)
     .def("getColors", &GeoWrapper::getColors)
+    .def("getSurfaceVoxels", &GeoWrapper::getSurfaceVoxels)
 
     // setters
     .def("setHashNumBuckets", &GeoWrapper::setHashNumBuckets)

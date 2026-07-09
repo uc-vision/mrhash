@@ -560,6 +560,10 @@ namespace pygeowrapper {
     streamer_->streamAllOut();
   }
 
+  Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> GeoWrapper::getSurfaceVoxels(const float surface_band) {
+    return voxelhasher_->surfaceVoxels(surface_band);
+  }
+
   void GeoWrapper::serializeData(const std::string& filename_hash, const std::string& filename_voxel) {
     streamer_->serializeData(filename_hash, filename_voxel);
   }

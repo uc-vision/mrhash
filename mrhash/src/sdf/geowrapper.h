@@ -94,6 +94,7 @@ namespace pygeowrapper {
     const Eigen::Matrix4f& getCurrPose() const { return curr_pose_.matrix(); }
     Eigen::MatrixX3f getPointCloud();
     Eigen::MatrixX3f getNormals();
+    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> getSurfaceVoxels(float surface_band);
     
     void setHashNumBuckets(int hash_num_buckets) { hash_num_buckets_ = hash_num_buckets; }
     void setNumSdfBlocks(int num_sdf_blocks) { num_sdf_blocks_ = num_sdf_blocks; }

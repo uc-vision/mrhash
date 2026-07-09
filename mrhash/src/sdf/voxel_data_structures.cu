@@ -1,6 +1,9 @@
 #include "voxel_data_structures.cuh"
 
 #include <cfloat>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+#include <thrust/scan.h>
 
 namespace cupanutils {
   namespace cugeoutils {
@@ -496,6 +499,102 @@ namespace cupanutils {
       CUDA_CHECK(cudaMemcpy(&current_occupied_blocks_, &d_compactHashCounter_[0], sizeof(uint), cudaMemcpyDeviceToHost));
       // copy current ptr to gpu, make sure current_occupied_blocks_ is updated in gpu
       CUDA_CHECK(cudaMemcpy(d_instance_, this, sizeof(VoxelContainer), cudaMemcpyHostToDevice));
+    }
+
+    template <typename T>
+    __global__ void surfaceVoxelCountsKernel(const VoxelContainer<T>* container, const float surface_band, uint* counts) {
+      const uint block_idx = blockIdx.x;
+      if (block_idx >= container->current_occupied_blocks_)
+        return;
+
+      __shared__ uint count;
+      if (threadIdx.x == 0)
+        count = 0;
+      __syncthreads();
+
+      const HashEntry& entry = container->d_compactHashTable_[block_idx];
+      const uint voxel_idx   = threadIdx.x;
+      if (voxel_idx < container->getNumVoxels(entry)) {
+        const T& voxel = container->d_SDFBlocks_[entry.ptr + voxel_idx];
+        if (voxel.weight > 0 && fabsf(voxel.sdf) <= surface_band)
+          atomicAdd(&count, 1);
+      }
+
+      __syncthreads();
+      if (threadIdx.x == 0)
+        counts[block_idx] = count;
+    }
+
+    template <typename T>
+    __global__ void surfaceVoxelFillKernel(const VoxelContainer<T>* container,
+                                           const uint* offsets,
+                                           const float surface_band,
+                                           float* voxels) {
+      const uint block_idx = blockIdx.x;
+      if (block_idx >= container->current_occupied_blocks_)
+        return;
+
+      __shared__ uint local_count;
+      if (threadIdx.x == 0)
+        local_count = 0;
+      __syncthreads();
+
+      const HashEntry& entry = container->d_compactHashTable_[block_idx];
+      const uint voxel_idx   = threadIdx.x;
+      if (voxel_idx < container->getNumVoxels(entry)) {
+        const T& voxel = container->d_SDFBlocks_[entry.ptr + voxel_idx];
+        if (voxel.weight > 0 && fabsf(voxel.sdf) <= surface_band) {
+          const uint output_idx = offsets[block_idx] + atomicAdd(&local_count, 1);
+          const int scale       = 1 << entry.resolution;
+          const int3 base       = SDFBlockToVirtualVoxelPos(entry.pos);
+          const int3 local =
+            scale * make_int3(delinearizeVoxelPos(voxel_idx, sdf_block_size / scale));
+          const float3 point = virtualVoxelPosToWorld(container->virtual_voxel_size_, base + local);
+          voxels[output_idx * 5 + 0] = point.x;
+          voxels[output_idx * 5 + 1] = point.y;
+          voxels[output_idx * 5 + 2] = point.z;
+          voxels[output_idx * 5 + 3] = voxel.sdf;
+          voxels[output_idx * 5 + 4] = static_cast<float>(voxel.weight);
+        }
+      }
+    }
+
+    template <typename T>
+    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+    VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::surfaceVoxels(const float surface_band) {
+      flatAndReduceHashTable();
+      if (current_occupied_blocks_ == 0)
+        return Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(0, 5);
+
+      uint* d_counts  = nullptr;
+      uint* d_offsets = nullptr;
+      float* d_voxels = nullptr;
+      CUDA_CHECK(cudaMalloc((void**) &d_counts, sizeof(uint) * current_occupied_blocks_));
+      CUDA_CHECK(cudaMalloc((void**) &d_offsets, sizeof(uint) * (current_occupied_blocks_ + 1)));
+      CUDA_CHECK(cudaMemset(d_offsets, 0, sizeof(uint)));
+
+      surfaceVoxelCountsKernel<<<current_occupied_blocks_, voxel_block_volume_>>>(d_instance_, surface_band, d_counts);
+      CUDA_CHECK(cudaDeviceSynchronize());
+
+      thrust::device_ptr<uint> counts_ptr(d_counts);
+      thrust::device_ptr<uint> offsets_ptr(d_offsets);
+      thrust::inclusive_scan(thrust::device, counts_ptr, counts_ptr + current_occupied_blocks_, offsets_ptr + 1);
+
+      uint surface_count = 0;
+      CUDA_CHECK(cudaMemcpy(&surface_count, d_offsets + current_occupied_blocks_, sizeof(uint), cudaMemcpyDeviceToHost));
+      Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> surface_voxels(surface_count, 5);
+      if (surface_count > 0) {
+        CUDA_CHECK(cudaMalloc((void**) &d_voxels, sizeof(float) * surface_count * 5));
+        surfaceVoxelFillKernel<<<current_occupied_blocks_, voxel_block_volume_>>>(d_instance_, d_offsets, surface_band, d_voxels);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(surface_voxels.data(), d_voxels, sizeof(float) * surface_count * 5, cudaMemcpyDeviceToHost));
+      }
+
+      CUDA_CHECK(cudaFree(d_counts));
+      CUDA_CHECK(cudaFree(d_offsets));
+      if (d_voxels != nullptr)
+        CUDA_CHECK(cudaFree(d_voxels));
+      return surface_voxels;
     }
 
     template <typename T>
