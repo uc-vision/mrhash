@@ -103,8 +103,32 @@ namespace cupanutils {
     template <typename T>
     void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::serializeData(const std::string& filename_hash,
                                                                                   const std::string& filename_voxel) const {
-      utils::PointCloud hash_points;
-      utils::PointCloud voxel_points;
+      uint hash_count  = 0;
+      uint voxel_count = 0;
+      for (const auto& [chunk_pos, chunk_ptr] : grid_) {
+        const data::vector<SDFBlockDesc>& descs = chunk_ptr->getSDFBlockDescs();
+        const data::vector<SDFBlock<T>>& blocks = chunk_ptr->getSDFBlocks();
+        for (uint k = 0; k < descs.size(); ++k) {
+          uint valid_voxels        = 0;
+          const int scale          = 1 << (finest_block_log2_dim - descs[k].resolution);
+          const int num_voxels     = scale * scale * scale;
+          for (uint l = 0; l < num_voxels; ++l) {
+            if (blocks[k].data[l].weight > 0) {
+              valid_voxels++;
+            }
+          }
+          voxel_count += valid_voxels;
+          hash_count += valid_voxels > 0 ? 1 : 0;
+        }
+      }
+
+      std::ofstream hash_file(filename_hash, std::ios::binary);
+      std::ofstream voxel_file(filename_voxel, std::ios::binary);
+      hash_file << "ply\nformat binary_little_endian 1.0\nelement vertex " << hash_count
+                << "\nproperty float x\nproperty float y\nproperty float z\nproperty float weight\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nproperty uchar alpha\nend_header\n";
+      voxel_file << "ply\nformat binary_little_endian 1.0\nelement vertex " << voxel_count
+                 << "\nproperty float x\nproperty float y\nproperty float z\nproperty float sdf\nproperty float weight\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nproperty uchar alpha\nend_header\n";
+
       for (const auto& [chunk_pos, chunk_ptr] : grid_) {
         const data::vector<SDFBlockDesc>& descs = chunk_ptr->getSDFBlockDescs();
         const data::vector<SDFBlock<T>>& blocks = chunk_ptr->getSDFBlocks();
@@ -119,27 +143,25 @@ namespace cupanutils {
           const int scaling_factor       = 1 << descs[k].resolution;
           for (uint l = 0; l < num_voxels; ++l) {
             if (blocks[k].data[l].weight > 0) {
-              // voxel world coordinates
               const Eigen::Vector3i dl =
                 CUDA2Eig(SDFBlock<T>::delinearizeVoxelIndex(l, sdf_block_size / scaling_factor)) * scaling_factor;
               const Eigen::Vector3f voxel_pw = block_pw + dl.cast<float>() * container_->virtual_voxel_size_;
-
-              // voxel color
               Eigen::Vector4f voxel_color;
               if (descs[k].resolution == 0) {
-                voxel_color(0) = 1.f;
-                voxel_color(1) = 0.f;
-                voxel_color(2) = 0.f;
-              } else if (descs[k].resolution == 1) {
-                voxel_color(0) = 0.f;
-                voxel_color(1) = 1.f;
-                voxel_color(2) = 0.f;
+                voxel_color = Eigen::Vector4f(1.f, 0.f, 0.f, 1.f);
+              } else {
+                voxel_color = Eigen::Vector4f(0.f, 1.f, 0.f, 1.f);
               }
-              voxel_color(3)           = 0;
               const float voxel_weight = static_cast<float>(blocks[k].data[l].weight);
               const float voxel_sdf    = blocks[k].data[l].sdf;
-              voxel_points.push_back(voxel_pw, voxel_color, voxel_weight, voxel_sdf);
-              // interpolate block color among valid voxels
+              unsigned char color[4]   = {(unsigned char) (voxel_color(0) * 255),
+                                           (unsigned char) (voxel_color(1) * 255),
+                                           (unsigned char) (voxel_color(2) * 255),
+                                           (unsigned char) (voxel_color(3) * 255)};
+              voxel_file.write((const char*) voxel_pw.data(), sizeof(float) * 3);
+              voxel_file.write((const char*) &voxel_sdf, sizeof(float));
+              voxel_file.write((const char*) &voxel_weight, sizeof(float));
+              voxel_file.write((const char*) color, sizeof(unsigned char) * 4);
               block_color += voxel_color;
               block_weight_sum += voxel_weight;
               valid_voxels++;
@@ -148,14 +170,17 @@ namespace cupanutils {
           if (valid_voxels > 0) {
             const Eigen::Vector4f avg_color = block_color / valid_voxels;
             const float avg_weight          = block_weight_sum / static_cast<float>(valid_voxels);
-            hash_points.push_back(block_pw, avg_color, avg_weight);
+            unsigned char color[4]          = {(unsigned char) (avg_color(0) * 255),
+                                                (unsigned char) (avg_color(1) * 255),
+                                                (unsigned char) (avg_color(2) * 255),
+                                                255};
+            hash_file.write((const char*) block_pw.data(), sizeof(float) * 3);
+            hash_file.write((const char*) &avg_weight, sizeof(float));
+            hash_file.write((const char*) color, sizeof(unsigned char) * 4);
           }
         }
       }
-
-      utils::PointCloudSerializer::saveToFile(filename_hash, hash_points);
-      utils::PointCloudSerializer::saveToFile(filename_voxel, voxel_points);
-      std::cout << "Streamer::serializeData | written " << hash_points.size() << " hash points and " << voxel_points.size()
+      std::cout << "Streamer::serializeData | written " << hash_count << " hash points and " << voxel_count
                 << " voxels to " << filename_hash << " and " << filename_voxel << std::endl;
     }
 
