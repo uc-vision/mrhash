@@ -22,13 +22,12 @@ target_include_directories(${GS_LIB_NAME} PUBLIC
     ${PROJECT_SOURCE_DIR}/third_party/tinyply/source)
 
 set_target_properties(${GS_LIB_NAME} PROPERTIES
-    CUDA_ARCHITECTURES native
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
     CUDA_SEPARABLE_COMPILATION ON
-    UNITY_BUILD ON
 )
 
 target_compile_options(${GS_LIB_NAME} PRIVATE -O3 -use_fast_math -Xcompiler -Ofast -lineinfo $<$<COMPILE_LANGUAGE:CUDA>: -g -lineinfo >)
