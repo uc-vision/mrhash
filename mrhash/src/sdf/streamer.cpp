@@ -462,6 +462,8 @@ namespace cupanutils {
     template <typename T>
     void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::calculateMemoryUsage() const {
       double toMB = 1e-6;
+      if (memory_allocation_filepath_.empty())
+        return;
 
       // host buffers
       const uint64_t size_h_SDFBlockDescOutput = sizeof(SDFBlockDesc) * max_num_sdf_block_integrate_from_global_hash_;

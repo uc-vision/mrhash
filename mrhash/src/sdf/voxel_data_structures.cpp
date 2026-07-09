@@ -8,6 +8,8 @@ namespace cupanutils {
 
     void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::calculateMemoryUsage() {
       double toMB = 1e-6;
+      if (memory_allocation_filepath_.empty())
+        return;
 
       std::ofstream out_file(memory_allocation_filepath_);
       if (!out_file.is_open()) {

@@ -66,13 +66,13 @@ namespace pygeowrapper {
                                                                                      min_weight_threshold,
                                                                                      sdf_var_threshold,
                                                                                      projective_sdf,
-                                                                                     true,
-                                                                                     "memory_allocation.txt",
-                                                                                     "integration_profiler",
-                                                                                     "rendering_profiler");
+                                                                                     false,
+                                                                                     "",
+                                                                                     "",
+                                                                                     "");
 
     streamer_ = std::make_unique<cupanutils::cugeoutils::GeometricStreamer>(
-      voxelhasher_.get(), true, "memory_allocation.txt", "streamer_profiler");
+      voxelhasher_.get(), false, "", "");
     streamer_->create(voxel_extents, max_num_sdf_block_integrate_from_global_hash_, initial_chunk_list_size);
     mesh_extractor_ = std::make_unique<cupanutils::cugeoutils::GeometricMarchingCubes>(
       marching_cubes_threshold, viewer_active, max_num_triangles_mesh_, vertices_merging_threshold);
