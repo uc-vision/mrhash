@@ -11,8 +11,13 @@ namespace cupanutils {
       __forceinline__ __host__ __device__ CUDAMat3() {
       }
 
+      __forceinline__ __host__ __device__ CUDAMat3(const float3& first, const float3& second, const float3& third) :
+        row0(first), row1(second), row2(third) {
+      }
+
       // copy constructor
-      __forceinline__ __host__ CUDAMat3(const CUDAMat3& other) : row0(other.row0), row1(other.row1), row2(other.row2) {
+      __forceinline__ __host__ __device__ CUDAMat3(const CUDAMat3& other) :
+        row0(other.row0), row1(other.row1), row2(other.row2) {
       }
 
       // constructs the matrix from an array-like matrix object (works with Eigen matrices)
@@ -42,20 +47,6 @@ namespace cupanutils {
         row2.z = arr[8];
       }
 
-      __forceinline__ __device__ CUDAMat3 transpose() const {
-        CUDAMat3 res;
-        res.row0.x = this->row0.x;
-        res.row0.y = this->row1.x;
-        res.row0.z = this->row2.x;
-        res.row1.x = this->row0.y;
-        res.row1.y = this->row1.y;
-        res.row1.z = this->row2.y;
-        res.row2.x = this->row0.z;
-        res.row2.y = this->row1.z;
-        res.row2.z = this->row2.z;
-        return res;
-      }
-
       // assignment operator
       __forceinline__ __host__ __device__ CUDAMat3& operator=(const CUDAMat3& other) {
         this->row0 = other.row0;
@@ -64,31 +55,47 @@ namespace cupanutils {
         return *this;
       }
 
-// define operators only in device code
-// we have eigen in host
+// define algebraic operations only in device code
 #ifdef __CUDACC__
-      // matrix-vector multiplication
-      __forceinline__ __device__ float3 operator*(const float3& point) const {
-        return make_float3(row0.x * point.x + row0.y * point.y + row0.z * point.z,
-                           row1.x * point.x + row1.y * point.y + row1.z * point.z,
-                           row2.x * point.x + row2.y * point.y + row2.z * point.z);
+      __forceinline__ __device__ static CUDAMat3 zero() {
+        return CUDAMat3(make_float3(0.f), make_float3(0.f), make_float3(0.f));
+      }
+
+      __forceinline__ __device__ static CUDAMat3 identity() {
+        return CUDAMat3(make_float3(1.f, 0.f, 0.f), make_float3(0.f, 1.f, 0.f), make_float3(0.f, 0.f, 1.f));
+      }
+
+      __forceinline__ __device__ float& at(const int row, const int column) {
+        return (&row0.x)[3 * row + column];
+      }
+
+      __forceinline__ __device__ const float& at(const int row, const int column) const {
+        return (&row0.x)[3 * row + column];
+      }
+
+      __forceinline__ __device__ float3 column(const int column_index) const {
+        return make_float3(at(0, column_index), at(1, column_index), at(2, column_index));
+      }
+
+      __forceinline__ __device__ CUDAMat3 transpose() const {
+        return CUDAMat3(column(0), column(1), column(2));
+      }
+
+      __forceinline__ __device__ float3 operator*(const float3& vector) const {
+        return make_float3(dot(row0, vector), dot(row1, vector), dot(row2, vector));
+      }
+
+      __forceinline__ __device__ CUDAMat3& operator+=(const CUDAMat3& matrix) {
+        row0 += matrix.row0;
+        row1 += matrix.row1;
+        row2 += matrix.row2;
+        return *this;
       }
 
       // matrix-matrix multiplication
       __forceinline__ __device__ CUDAMat3 operator*(const CUDAMat3& mat) const {
-        // clang-format off
-      CUDAMat3 res;
-      res.row0.x = this->row0.x * mat.row0.x + this->row0.y * mat.row1.x + this->row0.z * mat.row2.x; 
-      res.row0.y = this->row0.x * mat.row0.y + this->row0.y * mat.row1.y + this->row0.z * mat.row2.y; 
-      res.row0.z = this->row0.x * mat.row0.z + this->row0.y * mat.row1.z + this->row0.z * mat.row2.z;
-      res.row1.x = this->row1.x * mat.row0.x + this->row1.y * mat.row1.x + this->row1.z * mat.row2.x; 
-      res.row1.y = this->row1.x * mat.row0.y + this->row1.y * mat.row1.y + this->row1.z * mat.row2.y; 
-      res.row1.z = this->row1.x * mat.row0.z + this->row1.y * mat.row1.z + this->row1.z * mat.row2.z;
-      res.row2.x = this->row2.x * mat.row0.x + this->row2.y * mat.row1.x + this->row2.z * mat.row2.x; 
-      res.row2.y = this->row2.x * mat.row0.y + this->row2.y * mat.row1.y + this->row2.z * mat.row2.y; 
-      res.row2.z = this->row2.x * mat.row0.z + this->row2.y * mat.row1.z + this->row2.z * mat.row2.z;
-        // clang-format on
-        return res;
+        const CUDAMat3 transposed = mat.transpose();
+        return CUDAMat3(transposed * row0, transposed * row1, transposed * row2);
       }
 #endif
 

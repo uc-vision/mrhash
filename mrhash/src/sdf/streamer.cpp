@@ -9,16 +9,16 @@ namespace cupanutils {
     void
     Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::create(const Eigen::Vector3f& voxel_extents,
                                                                       const uint max_num_sdf_block_integrate_from_global_hash,
-                                                                      unsigned int initial_chunk_list_size) {
+                                                                      unsigned int initial_chunk_list_size,
+                                                                      bool compact_host_voxels) {
+      container_->voxel_extents_ = Eig2CUDA(voxel_extents);
       voxel_extents_             = voxel_extents;
       const float max_chunk_ext_ = std::max(std::max(voxel_extents_.x(), voxel_extents_.y()), voxel_extents_.z());
       chunk_radius_              = 0.5f * max_chunk_ext_ * sqrt(3.f);
       initial_chunk_list_size_   = initial_chunk_list_size;
+      compact_host_voxels_       = compact_host_voxels;
       max_num_sdf_block_integrate_from_global_hash_ = max_num_sdf_block_integrate_from_global_hash;
       stream_in_done_                               = true;
-
-      // propagate data to hash structure
-      container_->voxel_extents_ = Eig2CUDA(voxel_extents_);
 
       // use cuda host allocation, allocate page-lock memory on host,
       // this is required for asynchronous stream, parallel copy GPU-CPU
@@ -27,17 +27,23 @@ namespace cupanutils {
 
       // desc hash entry, other voxel
       CUDA_CHECK(cudaMallocHost(&h_SDFBlockDescOutput_, sizeof(SDFBlockDesc) * max_num_sdf_block_integrate_from_global_hash_));
-      CUDA_CHECK(
-        cudaMallocHost(&h_SDFBlockOutput_, sizeof(T) * total_sdf_block_size * max_num_sdf_block_integrate_from_global_hash_));
-
       CUDA_CHECK(cudaMalloc(&d_SDFBlockDescOutput_, sizeof(SDFBlockDesc) * max_num_sdf_block_integrate_from_global_hash_));
-      CUDA_CHECK(
-        cudaMalloc(&d_SDFBlockOutput_, sizeof(T) * total_sdf_block_size * max_num_sdf_block_integrate_from_global_hash_));
-
       CUDA_CHECK(cudaMalloc(&d_SDFBlockDescInput_, sizeof(SDFBlockDesc) * max_num_sdf_block_integrate_from_global_hash_));
-      CUDA_CHECK(cudaMalloc(&d_SDFBlockInput_, sizeof(T) * total_sdf_block_size * max_num_sdf_block_integrate_from_global_hash_));
+      const size_t voxel_count = total_sdf_block_size * max_num_sdf_block_integrate_from_global_hash_;
+      if (compact_host_voxels_) {
+        CUDA_CHECK(cudaMallocHost(&h_compact_voxel_output_, sizeof(CompactVoxel) * voxel_count));
+        CUDA_CHECK(cudaMalloc(&d_compact_voxel_output_, sizeof(CompactVoxel) * voxel_count));
+        CUDA_CHECK(cudaMalloc(&d_compact_voxel_input_, sizeof(CompactVoxel) * voxel_count));
+      } else {
+        CUDA_CHECK(cudaMallocHost(&h_SDFBlockOutput_, sizeof(T) * voxel_count));
+        CUDA_CHECK(cudaMalloc(&d_SDFBlockOutput_, sizeof(T) * voxel_count));
+        CUDA_CHECK(cudaMalloc(&d_SDFBlockInput_, sizeof(T) * voxel_count));
+      }
 
       CUDA_CHECK(cudaMalloc(&d_SDF_block_counter_, sizeof(uint)));
+      CUDA_CHECK(cudaMalloc(&d_voxel_offsets_, sizeof(uint) * max_num_sdf_block_integrate_from_global_hash_));
+      CUDA_CHECK(cudaMalloc(&d_blocks_ptr_, sizeof(uint) * max_num_sdf_block_integrate_from_global_hash_));
+      CUDA_CHECK(cudaMalloc(&d_merge_blocks_, sizeof(uchar) * max_num_sdf_block_integrate_from_global_hash_));
 
       container_->updateFieldsDevice(); // update this gets called after constructors
 
@@ -52,6 +58,25 @@ namespace cupanutils {
         chunk_ptr.reset();
       }
       grid_.clear();
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::rechunk(const float scale) {
+      auto source_grid = std::move(grid_);
+      voxel_extents_ *= scale;
+      chunk_radius_ = 0.5f * voxel_extents_.maxCoeff() * sqrt(3.f);
+      for (auto& [source_chunk, source] : source_grid) {
+        const uint block_count = source->getNElements();
+        for (uint block_index = 0; block_index < block_count; ++block_index) {
+          const SDFBlockDesc& desc = source->getSDFBlockDesc(block_index);
+          const Eigen::Vector3f world = CUDA2Eig(desc.pos).cast<float>() * sdf_block_size * container_->virtual_voxel_size_;
+          const Eigen::Vector3i chunk = worldToChunks(world);
+          grid_.try_emplace(
+            chunk, std::make_unique<ChunkDesc<T>>(initial_chunk_list_size_, compact_host_voxels_));
+          source->moveSDFBlock(block_index, *grid_.at(chunk));
+        }
+        source->clear();
+      }
     }
     template <typename T>
     void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::destroy() {
@@ -76,6 +101,10 @@ namespace cupanutils {
         CUDA_CHECK(cudaFreeHost(h_SDFBlockOutput_));
         h_SDFBlockOutput_ = nullptr;
       }
+      if (h_compact_voxel_output_) {
+        CUDA_CHECK(cudaFreeHost(h_compact_voxel_output_));
+        h_compact_voxel_output_ = nullptr;
+      }
 
       // Cleanup device memory
       if (d_SDFBlockDescOutput_) {
@@ -94,9 +123,29 @@ namespace cupanutils {
         CUDA_CHECK(cudaFree(d_SDFBlockInput_));
         d_SDFBlockInput_ = nullptr;
       }
+      if (d_compact_voxel_output_) {
+        CUDA_CHECK(cudaFree(d_compact_voxel_output_));
+        d_compact_voxel_output_ = nullptr;
+      }
+      if (d_compact_voxel_input_) {
+        CUDA_CHECK(cudaFree(d_compact_voxel_input_));
+        d_compact_voxel_input_ = nullptr;
+      }
       if (d_SDF_block_counter_) {
         CUDA_CHECK(cudaFree(d_SDF_block_counter_));
         d_SDF_block_counter_ = nullptr;
+      }
+      if (d_voxel_offsets_) {
+        CUDA_CHECK(cudaFree(d_voxel_offsets_));
+        d_voxel_offsets_ = nullptr;
+      }
+      if (d_blocks_ptr_) {
+        CUDA_CHECK(cudaFree(d_blocks_ptr_));
+        d_blocks_ptr_ = nullptr;
+      }
+      if (d_merge_blocks_) {
+        CUDA_CHECK(cudaFree(d_merge_blocks_));
+        d_merge_blocks_ = nullptr;
       }
     }
 
@@ -107,13 +156,12 @@ namespace cupanutils {
       uint voxel_count = 0;
       for (const auto& [chunk_pos, chunk_ptr] : grid_) {
         const data::vector<SDFBlockDesc>& descs = chunk_ptr->getSDFBlockDescs();
-        const data::vector<SDFBlock<T>>& blocks = chunk_ptr->getSDFBlocks();
         for (uint k = 0; k < descs.size(); ++k) {
           uint valid_voxels        = 0;
           const int scale          = 1 << (finest_block_log2_dim - descs[k].resolution);
           const int num_voxels     = scale * scale * scale;
           for (uint l = 0; l < num_voxels; ++l) {
-            if (blocks[k].data[l].weight > 0) {
+            if (chunk_ptr->getVoxel(k, l).weight > 0) {
               valid_voxels++;
             }
           }
@@ -131,7 +179,6 @@ namespace cupanutils {
 
       for (const auto& [chunk_pos, chunk_ptr] : grid_) {
         const data::vector<SDFBlockDesc>& descs = chunk_ptr->getSDFBlockDescs();
-        const data::vector<SDFBlock<T>>& blocks = chunk_ptr->getSDFBlocks();
         for (uint k = 0; k < descs.size(); ++k) {
           const Eigen::Vector3i pos      = CUDA2Eig(descs[k].pos);
           const Eigen::Vector3f block_pw = (pos * sdf_block_size).cast<float>() * container_->virtual_voxel_size_;
@@ -142,7 +189,8 @@ namespace cupanutils {
           const int num_voxels           = scale * scale * scale;
           const int scaling_factor       = 1 << descs[k].resolution;
           for (uint l = 0; l < num_voxels; ++l) {
-            if (blocks[k].data[l].weight > 0) {
+            const T voxel = chunk_ptr->getVoxel(k, l);
+            if (voxel.weight > 0) {
               const Eigen::Vector3i dl =
                 CUDA2Eig(SDFBlock<T>::delinearizeVoxelIndex(l, sdf_block_size / scaling_factor)) * scaling_factor;
               const Eigen::Vector3f voxel_pw = block_pw + dl.cast<float>() * container_->virtual_voxel_size_;
@@ -152,8 +200,8 @@ namespace cupanutils {
               } else {
                 voxel_color = Eigen::Vector4f(0.f, 1.f, 0.f, 1.f);
               }
-              const float voxel_weight = static_cast<float>(blocks[k].data[l].weight);
-              const float voxel_sdf    = blocks[k].data[l].sdf;
+              const float voxel_weight = static_cast<float>(voxel.weight);
+              const float voxel_sdf    = voxel.sdf;
               unsigned char color[4]   = {(unsigned char) (voxel_color(0) * 255),
                                            (unsigned char) (voxel_color(1) * 255),
                                            (unsigned char) (voxel_color(2) * 255),
@@ -208,11 +256,19 @@ namespace cupanutils {
           const int stream_size = curr_stream_out_blocks_;
           CUDA_CHECK(cudaMemcpy(
             &h_SDFBlockDescOutput_[0], &d_SDFBlockDescOutput_[0], sizeof(SDFBlockDesc) * stream_size, cudaMemcpyDeviceToHost));
-          CUDA_CHECK(cudaMemcpy(&h_SDFBlockOutput_[0],
-                                &d_SDFBlockOutput_[0],
-                                sizeof(T) * container_->voxel_block_volume_ * stream_size,
-                                cudaMemcpyDeviceToHost));
-          integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
+          if (compact_host_voxels_) {
+            CUDA_CHECK(cudaMemcpy(h_compact_voxel_output_,
+                                  d_compact_voxel_output_,
+                                  sizeof(CompactVoxel) * container_->voxel_block_volume_ * stream_size,
+                                  cudaMemcpyDeviceToHost));
+            integrateCompactInChunkGrid(h_SDFBlockDescOutput_, h_compact_voxel_output_);
+          } else {
+            CUDA_CHECK(cudaMemcpy(h_SDFBlockOutput_,
+                                  d_SDFBlockOutput_,
+                                  sizeof(T) * container_->voxel_block_volume_ * stream_size,
+                                  cudaMemcpyDeviceToHost));
+            integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
+          }
           streamed_out_blocks += curr_stream_out_blocks_;
         }
       }
@@ -222,7 +278,10 @@ namespace cupanutils {
     template <typename T>
     void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::streamOutToCPUPass1CPU() {
       if (curr_stream_out_blocks_ > 0) {
-        integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
+        if (compact_host_voxels_)
+          integrateCompactInChunkGrid(h_SDFBlockDescOutput_, h_compact_voxel_output_);
+        else
+          integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
       }
     }
 
@@ -250,7 +309,8 @@ namespace cupanutils {
         const float b               = 1.f - float(i) / float(curr_stream_out_blocks_);
         const Eigen::Vector4f color = Eigen::Vector4f(r, g, b, 1);
 
-        grid_.try_emplace(chunk_pos, std::make_unique<ChunkDesc<T>>(initial_chunk_list_size_));
+        grid_.try_emplace(
+          chunk_pos, std::make_unique<ChunkDesc<T>>(initial_chunk_list_size_, compact_host_voxels_));
 
         // add element to host list
         // if this element is in frustum cannot be accessed by the gpu anyway
@@ -258,6 +318,41 @@ namespace cupanutils {
         grid_.at(chunk_pos)->addSDFBlock(desc, block);
         start_idx += num_voxels;
       }
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrateCompactInChunkGrid(
+      const SDFBlockDesc* block_descs, const CompactVoxel* voxels) {
+      for (uint block_index = 0; block_index < curr_stream_out_blocks_; ++block_index) {
+        const SDFBlockDesc& desc = block_descs[block_index];
+        const Eigen::Vector3f world =
+          CUDA2Eig(desc.pos).cast<float>() * sdf_block_size * container_->virtual_voxel_size_;
+        const Eigen::Vector3i chunk = worldToChunks(world);
+        grid_.try_emplace(
+          chunk, std::make_unique<ChunkDesc<T>>(initial_chunk_list_size_, compact_host_voxels_));
+        grid_.at(chunk)->addCompactSDFBlock(desc, voxels + block_index * total_sdf_block_size);
+      }
+    }
+
+    template <typename T>
+    std::vector<Eigen::Vector3i> Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::chunks() {
+      std::unordered_set<Eigen::Vector3i, Vector3iHash> unique_chunks;
+      for (const auto& [chunk, contents] : grid_) {
+        if (contents->getNElements() > 0)
+          unique_chunks.insert(chunk);
+      }
+      container_->flatAndReduceHashTable();
+      std::vector<HashEntry> active_blocks(container_->current_occupied_blocks_);
+      CUDA_CHECK(cudaMemcpy(active_blocks.data(),
+                            container_->d_compactHashTable_,
+                            sizeof(HashEntry) * active_blocks.size(),
+                            cudaMemcpyDeviceToHost));
+      for (const HashEntry& entry : active_blocks) {
+        const Eigen::Vector3f world =
+          CUDA2Eig(entry.pos).cast<float>() * sdf_block_size * container_->virtual_voxel_size_;
+        unique_chunks.insert(worldToChunks(world));
+      }
+      return std::vector<Eigen::Vector3i>(unique_chunks.begin(), unique_chunks.end());
     }
 
     template <typename T>
@@ -273,22 +368,29 @@ namespace cupanutils {
         curr_stream_out_blocks_ = getSDFBlockCounter();
 
         if (curr_stream_out_blocks_ > 0) {
-          //-------------------------------------------------------
-          // Pass 2: Copy SDFBlocks to output buffer
-          //-------------------------------------------------------
           integrateFromGlobalHashPass2(curr_stream_out_blocks_, pass);
 
           const int stream_size = curr_stream_out_blocks_;
           CUDA_CHECK(cudaMemcpy(
             &h_SDFBlockDescOutput_[0], &d_SDFBlockDescOutput_[0], sizeof(SDFBlockDesc) * stream_size, cudaMemcpyDeviceToHost));
-          CUDA_CHECK(cudaMemcpy(&h_SDFBlockOutput_[0],
-                                &d_SDFBlockOutput_[0],
-                                sizeof(T) * container_->voxel_block_volume_ * stream_size,
-                                cudaMemcpyDeviceToHost));
+          if (compact_host_voxels_) {
+            CUDA_CHECK(cudaMemcpy(h_compact_voxel_output_,
+                                  d_compact_voxel_output_,
+                                  sizeof(CompactVoxel) * container_->voxel_block_volume_ * stream_size,
+                                  cudaMemcpyDeviceToHost));
+          } else {
+            CUDA_CHECK(cudaMemcpy(h_SDFBlockOutput_,
+                                  d_SDFBlockOutput_,
+                                  sizeof(T) * container_->voxel_block_volume_ * stream_size,
+                                  cudaMemcpyDeviceToHost));
+          }
           CUDA_CHECK(cudaEventRecord(stop_event_, 0));
           CUDA_CHECK(cudaEventSynchronize(stop_event_));
           CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start_event_, stop_event_));
-          integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
+          if (compact_host_voxels_)
+            integrateCompactInChunkGrid(h_SDFBlockDescOutput_, h_compact_voxel_output_);
+          else
+            integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
           streamed_out_blocks += curr_stream_out_blocks_;
         }
       }
@@ -310,40 +412,53 @@ namespace cupanutils {
 
       uint num_SDF_blocks = 0;
       uint copied_voxels  = 0;
+      stream_in_done_     = true;
 
       for (auto& [chunk_pos, chunk_ptr] : grid_) {
         if (!isChunkInSphere(chunk_pos, camera_pose, radius))
           continue;
 
         const uint num_blocks = chunk_ptr->getNElements();
+        const uint available = max_num_sdf_block_integrate_from_global_hash_ - num_SDF_blocks;
+        const uint copy_count = std::min(num_blocks, available);
+        for (uint i = 0; i < copy_count; ++i) {
+          const uint chunk_index = num_blocks - copy_count + i;
+          const SDFBlockDesc& desc = chunk_ptr->getSDFBlockDesc(chunk_index);
+          const int resolution     = desc.resolution;
+          const int scale          = 1 << (finest_block_log2_dim - resolution);
+          const int num_voxels     = scale * scale * scale;
 
-        if (num_blocks + num_SDF_blocks >= max_num_sdf_block_integrate_from_global_hash_) {
-          stream_in_done_ = false;
-          return num_SDF_blocks;
-        } else {
-          for (int i = 0; i < num_blocks; ++i) {
-            const SDFBlockDesc& desc = chunk_ptr->getSDFBlockDesc(i);
-            const int resolution     = desc.resolution;
-            const int scale          = 1 << (finest_block_log2_dim - resolution);
-            const int num_voxels     = scale * scale * scale;
-
-            CUDA_CHECK(
-              cudaMemcpy(d_SDFBlockDescInput_ + num_SDF_blocks + i, &desc, sizeof(SDFBlockDesc), cudaMemcpyHostToDevice));
-
-            CUDA_CHECK(cudaMemcpy(d_SDFBlockInput_ + copied_voxels,
-                                  chunk_ptr->getSDFBlock(i).data.data(),
-                                  sizeof(T) * num_voxels,
-                                  cudaMemcpyHostToDevice));
-            copied_voxels += num_voxels;
+          h_SDFBlockDescOutput_[num_SDF_blocks + i] = desc;
+          if (compact_host_voxels_) {
+            chunk_ptr->copyCompactSDFBlock(
+              chunk_index, h_compact_voxel_output_ + (num_SDF_blocks + i) * total_sdf_block_size);
+          } else {
+            chunk_ptr->copySDFBlock(chunk_index, h_SDFBlockOutput_ + copied_voxels);
           }
+          copied_voxels += num_voxels;
         }
-
-        // Host cleanup
-        chunk_ptr->clear();
-        num_SDF_blocks += num_blocks;
+        chunk_ptr->removeLastSDFBlocks(copy_count);
+        num_SDF_blocks += copy_count;
+        if (num_SDF_blocks == max_num_sdf_block_integrate_from_global_hash_) {
+          stream_in_done_ = false;
+          break;
+        }
       }
 
-      stream_in_done_ = true;
+      CUDA_CHECK(cudaMemcpy(d_SDFBlockDescInput_,
+                            h_SDFBlockDescOutput_,
+                            sizeof(SDFBlockDesc) * num_SDF_blocks,
+                            cudaMemcpyHostToDevice));
+      if (compact_host_voxels_) {
+        CUDA_CHECK(cudaMemcpy(d_compact_voxel_input_,
+                              h_compact_voxel_output_,
+                              sizeof(CompactVoxel) * total_sdf_block_size * num_SDF_blocks,
+                              cudaMemcpyHostToDevice));
+      } else {
+        CUDA_CHECK(cudaMemcpy(
+          d_SDFBlockInput_, h_SDFBlockOutput_, sizeof(T) * copied_voxels, cudaMemcpyHostToDevice));
+      }
+
       return num_SDF_blocks;
     }
 
@@ -379,13 +494,15 @@ namespace cupanutils {
 
           CUDA_CHECK(cudaMemcpy(&heap_count_prev, container_->d_heapCounterHigh_, sizeof(uint), cudaMemcpyDeviceToHost));
 
-          uint* d_blocks_ptr;
-          CUDA_CHECK(cudaMalloc((void**) &d_blocks_ptr, sizeof(uint) * curr_stream_in_blocks_));
-
-          chunkToGlobalHashPass1(curr_stream_in_blocks_, heap_count_prev, d_SDFBlockDescInput_, d_blocks_ptr);
-          chunkToGlobalHashPass2(
-            curr_stream_in_blocks_, heap_count_prev, d_SDFBlockDescInput_, (T*) d_SDFBlockInput_, d_blocks_ptr);
-          CUDA_CHECK(cudaFree(d_blocks_ptr));
+          chunkToGlobalHashPass1(
+            curr_stream_in_blocks_, heap_count_prev, d_SDFBlockDescInput_, d_blocks_ptr_, d_merge_blocks_);
+          if (compact_host_voxels_) {
+            chunkToGlobalHashPass2Compact(
+              curr_stream_in_blocks_, d_SDFBlockDescInput_, d_compact_voxel_input_, d_blocks_ptr_, d_merge_blocks_);
+          } else {
+            chunkToGlobalHashPass2(
+              curr_stream_in_blocks_, heap_count_prev, d_SDFBlockDescInput_, d_SDFBlockInput_, d_blocks_ptr_, d_merge_blocks_);
+          }
         }
       } while (!stream_in_done_);
     }

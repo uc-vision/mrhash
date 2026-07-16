@@ -11,7 +11,7 @@ using namespace pygeowrapper;
 
 NB_MODULE(pygeowrapper, m) {
   nb::class_<GeoWrapper>(m, "GeoWrapper")
-    .def(nb::init<float, float, int, float, int, int, bool, float, uchar, float, float, std::string, float, float, bool>(),
+    .def(nb::init<float, float, int, float, int, int, bool, float, uchar, float, float, std::string, float, float, bool, bool>(),
          nb::arg("sdf_truncation"),
          nb::arg("sdf_truncation_scale"),
          nb::arg("integration_weight_sample"),
@@ -26,7 +26,8 @@ NB_MODULE(pygeowrapper, m) {
          nb::arg("gs_optimization_param_path") = default_gs_optimization_param_path,
          nb::arg("sdf_var_threshold")          = default_sdf_var_threshold,
          nb::arg("vertices_merging_threshold") = default_vertices_merging_threshold,
-         nb::arg("projective_sdf")             = default_projective_sdf)
+         nb::arg("projective_sdf")             = default_projective_sdf,
+         nb::arg("two_sided_surface_field")    = false)
 
     // getters
     .def("getHashNumBuckets", &GeoWrapper::getHashNumBuckets)
@@ -48,6 +49,10 @@ NB_MODULE(pygeowrapper, m) {
     .def("getFaces", &GeoWrapper::getFaces)
     .def("getColors", &GeoWrapper::getColors)
     .def("getSurfaceVoxels", &GeoWrapper::getSurfaceVoxels)
+    .def("getTudfSurfaceVoxels",
+         &GeoWrapper::getTudfSurfaceVoxels,
+         nb::arg("partition_count") = 1,
+         nb::arg("partition_index") = 0)
 
     // setters
     .def("setHashNumBuckets", &GeoWrapper::setHashNumBuckets)
@@ -63,7 +68,9 @@ NB_MODULE(pygeowrapper, m) {
     .def("setMaxNumSdfBlockIntegrateFromGlobalHash", &GeoWrapper::setMaxNumSdfBlockIntegrateFromGlobalHash)
     .def("setVoxelExtentsScale", &GeoWrapper::setVoxelExtentsScale)
     .def("setRGBImage", nb::overload_cast<nb::ndarray<uint8_t>>(&GeoWrapper::setRGBImage))
+    .def("setRGBImageCUDA", &GeoWrapper::setRGBImageCUDA)
     .def("setDepthImage", nb::overload_cast<nb::ndarray<float>>(&GeoWrapper::setDepthImage))
+    .def("setDepthImageCUDA", &GeoWrapper::setDepthImageCUDA)
     .def("setPointCloud", nb::overload_cast<nb::ndarray<float>, bool>(&GeoWrapper::setPointCloud))
     .def("setPointCloud", nb::overload_cast<nb::ndarray<float>, nb::ndarray<float>>(&GeoWrapper::setPointCloud))
     .def("setCamera", &GeoWrapper::setCamera)
@@ -82,4 +89,52 @@ NB_MODULE(pygeowrapper, m) {
     .def("serializeGrid", &GeoWrapper::serializeGrid, nb::arg("filename") = cupanutils::cugeoutils::default_serializer_filename)
     .def(
       "deserializeGrid", &GeoWrapper::deserializeGrid, nb::arg("filename") = cupanutils::cugeoutils::default_serializer_filename);
+
+  m.def(
+    "createVoxelMap",
+    [](const float sdf_truncation,
+       const float sdf_truncation_scale,
+       const int integration_weight_sample,
+       const float virtual_voxel_size,
+       const int n_frames_invalidate_voxels,
+       const int voxel_extents_scale,
+       const uchar min_weight_threshold,
+       const float min_depth,
+       const float max_depth,
+       const std::string& gs_optimization_param_path,
+       const float sdf_var_threshold,
+       const bool projective_sdf,
+       const bool two_sided_surface_field) {
+      return new GeoWrapper(sdf_truncation,
+                            sdf_truncation_scale,
+                            integration_weight_sample,
+                            virtual_voxel_size,
+                            n_frames_invalidate_voxels,
+                            voxel_extents_scale,
+                            false,
+                            0.f,
+                            min_weight_threshold,
+                            min_depth,
+                            max_depth,
+                            gs_optimization_param_path,
+                            sdf_var_threshold,
+                            default_vertices_merging_threshold,
+                            projective_sdf,
+                            two_sided_surface_field,
+                            false);
+    },
+    nb::rv_policy::take_ownership,
+    nb::arg("sdf_truncation"),
+    nb::arg("sdf_truncation_scale"),
+    nb::arg("integration_weight_sample"),
+    nb::arg("virtual_voxel_size"),
+    nb::arg("n_frames_invalidate_voxels"),
+    nb::arg("voxel_extents_scale"),
+    nb::arg("min_weight_threshold"),
+    nb::arg("min_depth"),
+    nb::arg("max_depth"),
+    nb::arg("gs_optimization_param_path") = default_gs_optimization_param_path,
+    nb::arg("sdf_var_threshold")          = default_sdf_var_threshold,
+    nb::arg("projective_sdf")             = default_projective_sdf,
+    nb::arg("two_sided_surface_field")    = false);
 }

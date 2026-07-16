@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "mrhash"
-version = "0.0.1"
+version = "0.0.44"
 description = ""
 readme = "README.md"
 authors = [
@@ -21,20 +21,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
 ]
-dependencies = [
-    "PyYAML",
-    "numpy",
-    "rosbags",
-    "open3d",
-    "matplotlib",
-    "typer>=0.10.0",
-    "natsort",
-    "rich",
-    "setuptools",
-    "opencv-python",
-    "rerun-sdk",
-    "h5py"
-]
+dependencies = ["numpy"]
 
 [project.scripts]
 mrhash = "mrhash.apps.mrhash:run"

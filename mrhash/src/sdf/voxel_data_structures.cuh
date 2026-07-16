@@ -30,6 +30,7 @@ namespace cupanutils {
                                        const uchar min_weight_threshold,
                                        const float sdf_var_threshold,
                                        const bool projective_sdf,
+                                       const bool two_sided_surface_field,
                                        const bool write_timings,
                                        const std::string memory_allocation_filepath,
                                        const std::string int_profiler_name,
@@ -48,6 +49,7 @@ namespace cupanutils {
         min_weight_threshold_(min_weight_threshold),
         sdf_var_threshold_(sdf_var_threshold),
         projective_sdf_(projective_sdf),
+        two_sided_surface_field_(two_sided_surface_field),
         memory_allocation_filepath_(memory_allocation_filepath),
         integration_profiler_(int_profiler_name, write_timings),
         rendering_profiler_(rendering_profiler_name, write_timings) {
@@ -74,12 +76,11 @@ namespace cupanutils {
         CUDA_CHECK(cudaMalloc((void**) &d_reintegrate_, sizeof(uint) * num_sdf_blocks_));
         CUDA_CHECK(cudaMalloc((void**) &d_num_reintegrate_, sizeof(uint)));
         CUDA_CHECK(cudaMalloc((void**) &d_hashTable_, sizeof(HashEntry) * total_size_));
-        CUDA_CHECK(cudaMalloc((void**) &d_compactHashTable_, sizeof(HashEntry) * total_size_));
+        CUDA_CHECK(cudaMalloc((void**) &d_compactHashTable_, sizeof(HashEntry) * num_sdf_blocks_));
         CUDA_CHECK(cudaMalloc((void**) &d_hashDecision_, sizeof(int) * total_size_));
         CUDA_CHECK(cudaMalloc((void**) &d_compactHashCounter_, sizeof(uint)));
         CUDA_CHECK(cudaMalloc((void**) &d_hashTableBucketMutex_, sizeof(int) * hash_num_buckets_));
         CUDA_CHECK(cudaMalloc((void**) &d_heapCounterHigh_, sizeof(int)));
-        CUDA_CHECK(cudaMalloc((void**) &d_heapCounterLow_, sizeof(int)));
         CUDA_CHECK(cudaMalloc((void**) &d_heapCounterLow_, sizeof(int)));
         CUDA_CHECK(cudaMalloc((void**) &d_SDFBlocks_, sizeof(T) * num_sdf_blocks_ * voxel_block_volume_));
         CUDA_CHECK(cudaMalloc((void**) &d_weight_, sizeof(uchar)));
@@ -174,20 +175,20 @@ namespace cupanutils {
       __host__ void flatAndReduceHashTable(const Camera& camera);
       __host__ void flatAndReduceHashTable();
 
-      __host__ void allocBlocks(const CUDAMatrixf3& point_cloud_img, const Camera& camera);
+      __host__ void allocBlocks(const CUDAMatrixf& depth_img, const Camera& camera);
       __host__ void allocBlocks3D(const CUDAVectorf3& point_cloud,
                                   const CUDAVectorf3& normals,
                                   const CUDAVectorf weights,
                                   const Camera& camera);
-      __host__ void integrateDepthMap(const CUDAMatrixf3& point_cloud_img, const CUDAMatrixuc3& rgb_img, const Camera& camera);
-      __host__ void reintegrateDepthMap(const CUDAMatrixf3& point_cloud_img, const CUDAMatrixuc3& rgb_img, const Camera& camera);
+      __host__ void integrateDepthMap(const CUDAMatrixf& depth_img, const CUDAMatrixuc3& rgb_img, const Camera& camera);
+      __host__ void reintegrateDepthMap(const CUDAMatrixf& depth_img, const CUDAMatrixuc3& rgb_img, const Camera& camera);
       __host__ void
       integrate3D(const CUDAVectorf3& point_cloud, const CUDAVectorf3& normals, const CUDAVectorf& weights, const Camera& camera);
       __host__ void reintegrate3D(const CUDAVectorf3& point_cloud,
                                   const CUDAVectorf3& normals,
                                   const CUDAVectorf& weights,
                                   const Camera& camera);
-      void integrate(const CUDAMatrixf3& point_cloud_img,
+      void integrate(const CUDAMatrixf& depth_img,
                      const CUDAMatrixuc3& rgb_img,
                      const Camera& camera,
                      const int max_num_frames);
@@ -197,6 +198,8 @@ namespace cupanutils {
                      const Camera& camera,
                      const int max_num_frames);
       __host__ Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> surfaceVoxels(float surface_band);
+      __host__ Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+      tudfSurfaceVoxels(const int3& owner_chunk, const float3& chunk_extents);
       __host__ void garbageCollect(const Camera& camera, const int max_num_frames);
 
       // some internal methods
@@ -272,6 +275,7 @@ namespace cupanutils {
       uchar min_weight_threshold_    = 0;          // threshold weight for trilinearinterpolation
       float sdf_var_threshold_       = 0.f;        // threshold sdf variance for voxel merging
       bool projective_sdf_           = false;      // wheter to use projection or non-projective sdf
+      bool two_sided_surface_field_  = false;
       // clang-format on
 
       // query

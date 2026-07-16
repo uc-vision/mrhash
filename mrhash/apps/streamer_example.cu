@@ -114,7 +114,7 @@ int main(int argc, char* argv[]) {
 
   const Eigen::Vector3f voxel_extents = Eigen::Vector3f::Ones() * voxel_extents_scale;
   uint initial_chunk_list_size        = 0;
-  streamer.create(voxel_extents, max_num_sdf_block_integrate_from_global_hash, initial_chunk_list_size);
+  streamer.create(voxel_extents, max_num_sdf_block_integrate_from_global_hash, initial_chunk_list_size, false);
   // simulate a circular path
   // auto path = makeCameraCircularTrajectory(translation_step, steps);
   auto path = makeCameraStraightTrajectory(translation_step, steps);
@@ -146,11 +146,6 @@ int main(int argc, char* argv[]) {
     }
     depth_img.toDevice();
 
-    camera.setDepthImage(depth_img);
-    // inverse projection to get point cloud once
-    CUDAMatrixf3 point_cloud_img;
-    camera.computeCloud(point_cloud_img);
-
     // dummy rgb image
     CUDAMatrixuc3 rgb_img(rows, cols);
 
@@ -159,7 +154,7 @@ int main(int argc, char* argv[]) {
     Eigen::Vector3f cam_pose_in_world = T.translation();
     streamer.stream(cam_pose_in_world, max_radius_for_stream);
 
-    voxelhasher.integrate(point_cloud_img, rgb_img, camera, n_frames_invalidate_voxels);
+    voxelhasher.integrate(depth_img, rgb_img, camera, n_frames_invalidate_voxels);
   }
 
   streamer.printStatistics();

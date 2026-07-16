@@ -1,9 +1,13 @@
 #pragma once
+#include "cuda_algebra.cuh"
 #include "cuda_utils.cuh"
 #include <type_traits>
 
 namespace cupanutils {
   namespace cugeoutils {
+
+    inline constexpr float tudf_qef_eigenvalue_ratio = 0.0064f;
+    inline constexpr float tudf_folded_variance_scale = 0.5f;
 
     struct Voxel {
       __host__ __device__ Voxel() {
@@ -20,6 +24,124 @@ namespace cupanutils {
         return std::tie(sdf, sum_squared, rgb, weight);
       }
     };
+
+    __host__ __device__ inline uchar twoSidedSurfaceWeight(const Voxel& voxel) {
+      return voxel.weight;
+    }
+
+    __host__ __device__ inline float twoSidedSurfaceDistance(const Voxel& voxel) {
+      if (voxel.sum_squared < 0.f)
+        return voxel.sdf;
+      const float variance = fmaxf(0.f, voxel.sum_squared - voxel.sdf * voxel.sdf);
+      return sqrtf(fmaxf(0.f, voxel.sdf * voxel.sdf - tudf_folded_variance_scale * variance));
+    }
+
+#ifdef __CUDACC__
+    struct TudfQef {
+      CUDAMat3 ata = CUDAMat3::zero();
+      float3 atb = make_float3(0.f);
+      float3 normal_sum = make_float3(0.f);
+      float3 reference_normal = make_float3(0.f);
+      int plane_count = 0;
+    };
+
+    __device__ inline CUDAMat3 outerProduct(const float3 vector) {
+      return CUDAMat3(vector.x * vector, vector.y * vector, vector.z * vector);
+    }
+
+    __device__ inline void addTudfPlane(TudfQef& qef, float3 normal, const float3 point) {
+      if (qef.plane_count == 0)
+        qef.reference_normal = normal;
+      else if (dot(normal, qef.reference_normal) < 0.f)
+        normal = -normal;
+      const float offset = dot(normal, point);
+      qef.ata += outerProduct(normal);
+      qef.atb += offset * normal;
+      qef.normal_sum += normal;
+      ++qef.plane_count;
+    }
+
+    __device__ inline void rotateSymmetricTudfMatrix(
+      CUDAMat3& matrix, CUDAMat3& vectors, const int first, const int second) {
+      const float off_diagonal = matrix.at(first, second);
+      if (fabsf(off_diagonal) <= 1e-7f)
+        return;
+      const float tau = (matrix.at(second, second) - matrix.at(first, first)) / (2.f * off_diagonal);
+      const float tangent = copysignf(1.f, tau) / (fabsf(tau) + sqrtf(1.f + tau * tau));
+      const float cosine = 1.f / sqrtf(1.f + tangent * tangent);
+      const float sine = tangent * cosine;
+      const float first_diagonal = matrix.at(first, first);
+      const float second_diagonal = matrix.at(second, second);
+      matrix.at(first, first) = first_diagonal - tangent * off_diagonal;
+      matrix.at(second, second) = second_diagonal + tangent * off_diagonal;
+      matrix.at(first, second) = 0.f;
+      matrix.at(second, first) = 0.f;
+      for (int axis = 0; axis < 3; ++axis) {
+        if (axis != first && axis != second) {
+          const float first_value = matrix.at(axis, first);
+          const float second_value = matrix.at(axis, second);
+          matrix.at(axis, first) = cosine * first_value - sine * second_value;
+          matrix.at(first, axis) = matrix.at(axis, first);
+          matrix.at(axis, second) = sine * first_value + cosine * second_value;
+          matrix.at(second, axis) = matrix.at(axis, second);
+        }
+        const float first_vector = vectors.at(axis, first);
+        const float second_vector = vectors.at(axis, second);
+        vectors.at(axis, first) = cosine * first_vector - sine * second_vector;
+        vectors.at(axis, second) = sine * first_vector + cosine * second_vector;
+      }
+    }
+
+    __device__ inline int solveTudfQef(
+      const TudfQef& qef,
+      const float3 center,
+      float3& point,
+      float3& normal,
+      float3& direction) {
+      if (qef.plane_count == 0)
+        return 0;
+      CUDAMat3 matrix = qef.ata;
+      CUDAMat3 vectors = CUDAMat3::identity();
+      for (int sweep = 0; sweep < 6; ++sweep) {
+        rotateSymmetricTudfMatrix(matrix, vectors, 0, 1);
+        rotateSymmetricTudfMatrix(matrix, vectors, 0, 2);
+        rotateSymmetricTudfMatrix(matrix, vectors, 1, 2);
+      }
+      const float3 centered_atb = qef.atb - qef.ata * center;
+      const float maximum_eigenvalue =
+        fmaxf(matrix.at(0, 0), fmaxf(matrix.at(1, 1), matrix.at(2, 2)));
+      const float eigenvalue_threshold = maximum_eigenvalue * tudf_qef_eigenvalue_ratio;
+      float3 displacement = make_float3(0.f);
+      int rank = 0;
+      direction = make_float3(0.f);
+      for (int axis = 0; axis < 3; ++axis) {
+        const float eigenvalue = matrix.at(axis, axis);
+        if (eigenvalue <= eigenvalue_threshold) {
+          direction = vectors.column(axis);
+          continue;
+        }
+        const float3 eigenvector = vectors.column(axis);
+        displacement += dot(eigenvector, centered_atb) / eigenvalue * eigenvector;
+        ++rank;
+      }
+      point = center + displacement;
+      normal = normalize(qef.normal_sum);
+      return rank;
+    }
+#endif
+
+    __host__ __device__ inline float surfaceDerivative(
+      const Voxel& negative, const Voxel& center, const Voxel& positive, const uchar minimum_weight) {
+      const bool negative_observed = negative.weight >= minimum_weight;
+      const bool positive_observed = positive.weight >= minimum_weight;
+      if (negative_observed && positive_observed)
+        return 0.5f * (positive.sdf - negative.sdf);
+      if (positive_observed)
+        return positive.sdf - center.sdf;
+      if (negative_observed)
+        return center.sdf - negative.sdf;
+      return 0.f;
+    }
 
     template <typename T>
     struct is_voxel_derived : std::is_base_of<Voxel, T> {};
@@ -178,6 +300,17 @@ namespace cupanutils {
       // merge sdf and weight
       out.sdf    = (v0.sdf * v0.weight + v1.sdf * v1.weight) / (v0.weight + v1.weight);
       out.weight = min(integration_weight_max, v0.weight + v1.weight);
+    }
+
+    template <typename T>
+    __forceinline__ __host__ __device__ void combineTwoSidedSurfaceVoxel(
+      const T& stored, const T& input, const int integration_weight_max, T& output) {
+      output = stored;
+      const int weight = stored.weight + input.weight;
+      output.sdf = (stored.sdf * stored.weight + input.sdf * input.weight) / weight;
+      output.sum_squared =
+        (stored.sum_squared * stored.weight + input.sum_squared * input.weight) / weight;
+      output.weight = min(integration_weight_max, weight);
     }
 
     //! returns the truncation of the SDF for a given distance value

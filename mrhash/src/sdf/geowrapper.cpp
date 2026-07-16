@@ -2,6 +2,9 @@
 #include "cuda_matrix.cuh"
 #include "serializer.h"
 #include "surface_normal_estimator/mad_tree.h"
+#include <algorithm>
+#include <malloc.h>
+#include <stdexcept>
 #include <vector>
 
 namespace pygeowrapper {
@@ -20,7 +23,9 @@ namespace pygeowrapper {
                          const std::string& gs_optimization_param_path,
                          float sdf_var_threshold,
                          float vertices_merging_threshold,
-                         bool projective_sdf) :
+                         bool projective_sdf,
+                         bool two_sided_surface_field,
+                         bool allocate_mesh) :
     sdf_truncation_(sdf_truncation),
     sdf_truncation_scale_(sdf_truncation_scale),
     integration_weight_sample_(integration_weight_sample),
@@ -45,13 +50,14 @@ namespace pygeowrapper {
       free *= gs_scaling_ratio;
       gs_container_ = std::make_unique<cupanutils::cugeoutils::GeometricGaussianContainer>(gs_optimization_param_path_);
     }
-    size_t to_alloc         = free * SDFBlocks_ratio;
-    num_sdf_blocks_         = (to_alloc * SDFBlocks_ratio) / (sizeof(cupanutils::cugeoutils::Voxel) * total_sdf_block_size);
+    const float sdf_blocks_ratio = allocate_mesh ? SDFBlocks_ratio : voxel_map_SDFBlocks_ratio;
+    size_t to_alloc              = free * sdf_blocks_ratio;
+    const size_t sdf_block_bytes = allocate_mesh ? to_alloc * sdf_blocks_ratio : to_alloc;
+    num_sdf_blocks_ = sdf_block_bytes / (sizeof(cupanutils::cugeoutils::Voxel) * total_sdf_block_size);
     hash_num_buckets_       = num_sdf_blocks_;
     hash_bucket_size_       = hash_bucket_size;
-    max_num_triangles_mesh_ = (to_alloc * mesh_ratio) / sizeof(cupanutils::cugeoutils::Triangle);
-    max_num_sdf_block_integrate_from_global_hash_ =
-      (to_alloc * SDFBlocks_stream_ratio) / (sizeof(cupanutils::cugeoutils::Voxel) * total_sdf_block_size);
+    max_num_triangles_mesh_ = allocate_mesh ? (to_alloc * mesh_ratio) / sizeof(cupanutils::cugeoutils::Triangle) : 0;
+    max_num_sdf_block_integrate_from_global_hash_ = std::min(num_sdf_blocks_, static_cast<int>(max_streaming_blocks));
 
     const Eigen::Vector3f voxel_extents = Eigen::Vector3f::Ones() * voxel_extents_scale;
     uint initial_chunk_list_size        = 0;
@@ -66,6 +72,7 @@ namespace pygeowrapper {
                                                                                      min_weight_threshold,
                                                                                      sdf_var_threshold,
                                                                                      projective_sdf,
+                                                                                     two_sided_surface_field,
                                                                                      false,
                                                                                      "",
                                                                                      "",
@@ -73,9 +80,12 @@ namespace pygeowrapper {
 
     streamer_ = std::make_unique<cupanutils::cugeoutils::GeometricStreamer>(
       voxelhasher_.get(), false, "", "");
-    streamer_->create(voxel_extents, max_num_sdf_block_integrate_from_global_hash_, initial_chunk_list_size);
-    mesh_extractor_ = std::make_unique<cupanutils::cugeoutils::GeometricMarchingCubes>(
-      marching_cubes_threshold, viewer_active, max_num_triangles_mesh_, vertices_merging_threshold);
+    streamer_->create(
+      voxel_extents, max_num_sdf_block_integrate_from_global_hash_, initial_chunk_list_size, !allocate_mesh && sdf_var_threshold == 0.f);
+    if (allocate_mesh) {
+      mesh_extractor_ = std::make_unique<cupanutils::cugeoutils::GeometricMarchingCubes>(
+        marching_cubes_threshold, viewer_active, max_num_triangles_mesh_, vertices_merging_threshold);
+    }
 
     setCamera(1.f, 1.f, 0.f, 0.f, 1, 1, min_depth, max_depth, 1);
   }
@@ -111,21 +121,19 @@ namespace pygeowrapper {
     voxelhasher_->setIntegrationDistance(max_depth);
 
     const cupanutils::cugeoutils::CameraModel model = (cupanutils::cugeoutils::CameraModel) camera_model;
-    camera_     = std::make_unique<cupanutils::cugeoutils::Camera>(d_cam_K, rows, cols, min_depth, max_depth, model);
-    view_depth_ = cupanutils::cugeoutils::CUDAMatrixf(camera_->rows(), camera_->cols());
+    camera_ = std::make_unique<cupanutils::cugeoutils::Camera>(d_cam_K, rows, cols, min_depth, max_depth, model);
   }
 
   void GeoWrapper::compute() {
     // set absolute pose
     camera_->setCamInWorld(curr_pose_.matrix());
 
-    cupanutils::cugeoutils::CUDAMatrixf3 point_cloud_img;
     if (depth_img_.size()) {
       // inverse projection to get point cloud once
-      depth_img_.toDevice();
-      rgb_img_.toDevice();
-      camera_->setDepthImage(depth_img_);
-      camera_->computeCloud(point_cloud_img);
+      if (!images_on_device_) {
+        depth_img_.toDevice();
+        rgb_img_.toDevice();
+      }
     }
 
     if (point_cloud_.size()) {
@@ -138,7 +146,7 @@ namespace pygeowrapper {
       streamer_->stream(curr_pose_.translation(), camera_->maxDepth());
 
     if (depth_img_.size() && rgb_img_.size()) {
-      voxelhasher_->integrate(point_cloud_img, rgb_img_, *camera_, n_frames_invalidate_voxels_);
+      voxelhasher_->integrate(depth_img_, rgb_img_, *camera_, n_frames_invalidate_voxels_);
       if (gs_container_)
         gs_container_->runGS(*camera_, *voxelhasher_, rgb_img_, depth_img_);
     }
@@ -244,6 +252,7 @@ namespace pygeowrapper {
   }
 
   void GeoWrapper::setRGBImage(nb::ndarray<uint8_t> input_rgb_array) {
+    images_on_device_ = false;
     // check the dimensions of the input array
     if (input_rgb_array.ndim() != 3) {
       throw std::runtime_error("GeoWrapper::setRGBImage|input should be a 3D numpy array");
@@ -273,7 +282,19 @@ namespace pygeowrapper {
     }
   }
 
+  void GeoWrapper::setRGBImageCUDA(CudaRGBImage input_rgb_array) {
+    images_on_device_ = true;
+    const size_t rows = input_rgb_array.shape(0);
+    const size_t cols = input_rgb_array.shape(1);
+    rgb_img_.resize(rows, cols);
+    CUDA_CHECK(cudaMemcpy(rgb_img_.data<cupanutils::cugeoutils::Device>(),
+                          input_rgb_array.data(),
+                          sizeof(uchar3) * rows * cols,
+                          cudaMemcpyDeviceToDevice));
+  }
+
   void GeoWrapper::setRGBImage(const cv::Mat& input_rgb_image) {
+    images_on_device_ = false;
     // check that the input is 3-channel 8-bit
     if (input_rgb_image.type() != CV_8UC3) {
       throw std::runtime_error("GeoWrapper::setRGBImage|input Mat should be CV_8UC3");
@@ -298,6 +319,7 @@ namespace pygeowrapper {
   }
 
   void GeoWrapper::setDepthImage(nb::ndarray<float> input_depth_array) {
+    images_on_device_ = false;
     // check the dimensions of the input array
     if (input_depth_array.ndim() != 2) {
       throw std::runtime_error("GeoWrapper::setDepthImage|input should be a 2D numpy array");
@@ -320,7 +342,19 @@ namespace pygeowrapper {
     }
   }
 
+  void GeoWrapper::setDepthImageCUDA(CudaDepthImage input_depth_array) {
+    images_on_device_ = true;
+    const size_t rows = input_depth_array.shape(0);
+    const size_t cols = input_depth_array.shape(1);
+    depth_img_.resize(rows, cols);
+    CUDA_CHECK(cudaMemcpy(depth_img_.data<cupanutils::cugeoutils::Device>(),
+                          input_depth_array.data(),
+                          sizeof(float) * rows * cols,
+                          cudaMemcpyDeviceToDevice));
+  }
+
   void GeoWrapper::setDepthImage(const cv::Mat& input_depth_image) {
+    images_on_device_ = false;
     // check that the input is single-channel float
     if (input_depth_image.type() != CV_32FC1) {
       throw std::runtime_error("GeoWrapper::setDepthImage|input Mat should be CV_32FC1");
@@ -562,6 +596,101 @@ namespace pygeowrapper {
 
   Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> GeoWrapper::getSurfaceVoxels(const float surface_band) {
     return voxelhasher_->surfaceVoxels(surface_band);
+  }
+
+  Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+  GeoWrapper::getTudfSurfaceVoxels(const int partition_count, const int partition_index) {
+    if (partition_count < 1 || partition_index < 0 || partition_index >= partition_count)
+      throw std::invalid_argument("Surface partition index must be within the positive partition count");
+    streamer_->streamAllOut();
+    streamer_->rechunk(0.5f);
+    std::vector<Eigen::Vector3i> chunks = streamer_->chunks();
+
+    using SurfaceVoxels = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    if (chunks.empty())
+      return SurfaceVoxels(0, 5);
+
+    Eigen::Vector3i minimum_chunk = chunks.front();
+    Eigen::Vector3i maximum_chunk = chunks.front();
+    for (const Eigen::Vector3i& chunk : chunks) {
+      minimum_chunk = minimum_chunk.cwiseMin(chunk);
+      maximum_chunk = maximum_chunk.cwiseMax(chunk);
+    }
+    const Eigen::Vector3i chunk_spans = maximum_chunk - minimum_chunk;
+    Eigen::Index major_axis = 0;
+    chunk_spans.maxCoeff(&major_axis);
+    const int axis_chunk_count = maximum_chunk[major_axis] - minimum_chunk[major_axis] + 1;
+    const int partition_start = minimum_chunk[major_axis] + axis_chunk_count * partition_index / partition_count;
+    const int partition_end = minimum_chunk[major_axis] + axis_chunk_count * (partition_index + 1) / partition_count;
+    std::vector<Eigen::Vector3i> owner_chunks;
+    for (const Eigen::Vector3i& chunk : chunks) {
+      if (chunk[major_axis] >= partition_start && chunk[major_axis] < partition_end)
+        owner_chunks.push_back(chunk);
+    }
+    std::sort(owner_chunks.begin(), owner_chunks.end(), [major_axis](const Eigen::Vector3i& left, const Eigen::Vector3i& right) {
+      for (int offset = 0; offset < 3; ++offset) {
+        const Eigen::Index axis = (major_axis + offset) % 3;
+        if (left[axis] != right[axis])
+          return left[axis] < right[axis];
+      }
+      return false;
+    });
+    const int current_chunk_axis = streamer_->worldToChunks(curr_pose_.translation())[major_axis];
+    if (!owner_chunks.empty() &&
+        std::abs(current_chunk_axis - owner_chunks.back()[major_axis]) <
+          std::abs(current_chunk_axis - owner_chunks.front()[major_axis]))
+      std::reverse(owner_chunks.begin(), owner_chunks.end());
+
+    std::vector<SurfaceVoxels> chunk_voxels;
+    Eigen::Index total_voxels = 0;
+    const float neighborhood_radius = 2.2f * streamer_->getChunkRadiusInMeter();
+    std::cout << "Extracting " << owner_chunks.size() << " TUDF chunks" << std::endl;
+    std::vector<size_t> last_use(chunks.size(), owner_chunks.size());
+    for (size_t data_index = 0; data_index < chunks.size(); ++data_index) {
+      for (size_t owner_index = 0; owner_index < owner_chunks.size(); ++owner_index) {
+        if (streamer_->isChunkInSphere(
+              chunks[data_index], streamer_->chunkToWorld(owner_chunks[owner_index]), neighborhood_radius))
+          last_use[data_index] = owner_index;
+      }
+    }
+    std::vector<Eigen::Vector3i> unused_chunks;
+    for (size_t data_index = 0; data_index < chunks.size(); ++data_index) {
+      if (last_use[data_index] == owner_chunks.size()) {
+        unused_chunks.push_back(chunks[data_index]);
+        streamer_->eraseChunk(chunks[data_index]);
+      }
+    }
+    if (!unused_chunks.empty())
+      streamer_->discardChunks(unused_chunks);
+    for (size_t owner_index = 0; owner_index < owner_chunks.size(); ++owner_index) {
+      const Eigen::Vector3i& chunk = owner_chunks[owner_index];
+      streamer_->streamInToGPU(streamer_->chunkToWorld(chunk), neighborhood_radius);
+      SurfaceVoxels selected = voxelhasher_->tudfSurfaceVoxels(
+        cupanutils::cugeoutils::Eig2CUDA(chunk),
+        cupanutils::cugeoutils::Eig2CUDA(streamer_->getChunkExtents()));
+      total_voxels += selected.rows();
+      chunk_voxels.push_back(std::move(selected));
+      std::vector<Eigen::Vector3i> expired_chunks;
+      for (size_t data_index = 0; data_index < chunks.size(); ++data_index) {
+        if (last_use[data_index] == owner_index) {
+          expired_chunks.push_back(chunks[data_index]);
+          streamer_->eraseChunk(chunks[data_index]);
+        }
+      }
+      if (!expired_chunks.empty())
+        streamer_->discardChunks(expired_chunks);
+      std::cout << "\rExtracting TUDF chunks: " << owner_index + 1 << '/' << owner_chunks.size() << std::flush;
+    }
+    std::cout << std::endl;
+    malloc_trim(0);
+
+    SurfaceVoxels surface_voxels(total_voxels, 5);
+    Eigen::Index offset = 0;
+    for (const SurfaceVoxels& selected : chunk_voxels) {
+      surface_voxels.middleRows(offset, selected.rows()) = selected;
+      offset += selected.rows();
+    }
+    return surface_voxels;
   }
 
   void GeoWrapper::serializeData(const std::string& filename_hash, const std::string& filename_voxel) {

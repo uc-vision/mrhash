@@ -155,7 +155,6 @@ namespace cupanutils {
         if (capacity_) {
           buffers_[Host] = new CellType[capacity_];
           CUDA_CHECK(cudaMalloc((void**) &buffers_[Device], sizeof(CellType) * capacity_));
-          CUDA_CHECK(cudaMemcpy(buffers_[Device], buffers_[Host], sizeof(CellType) * capacity_, cudaMemcpyHostToDevice));
         }
 
         copyHeader_();

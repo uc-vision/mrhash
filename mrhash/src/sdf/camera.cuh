@@ -67,8 +67,7 @@ namespace cupanutils {
       __host__ __device__ float vfov() const { return vfov_; }
       __host__ __device__ CameraModel model() const { return model_; }
 
-      void computeCloud(CUDAMatrixf3& point_cloud_img);
-      void setDepthImage(CUDAMatrixf& depth_img){ depth_img_ = depth_img; }
+      void computeCloud(const CUDAMatrixf& depth_img, CUDAMatrixf3& point_cloud_img);
       void setCamInWorld(const Eigen::Matrix4f& cam_in_world){ cam_in_world_ = CUDAMatSE3(cam_in_world);  CUDA_CHECK(cudaMemcpy(d_instance_, this, sizeof(Camera), cudaMemcpyHostToDevice));}
       __host__ __device__ float maxDepth() const { return max_depth_; }
       __host__ __device__ float minDepth() const { return min_depth_; }
@@ -211,8 +210,6 @@ namespace cupanutils {
 
     private:
       Camera* d_instance_ = nullptr;
-      CUDAMatrixf depth_img_;
-      CUDAMatrixuc3 rgb_img_;
       dim3 blocks_, threads_;
       uint rows_, cols_;
       int row_threshold_, col_threshold_; // Signed to allow negative bounds checking

@@ -53,11 +53,10 @@ TEST(INV_PROJECTION, FixedDepth) {
   // Eigen::Matrix4f cam_in_world = Eigen::Matrix4f::Identity();
 
   Camera camera(d_cam_K, rows, cols, 0.f, 5.f);
-  camera.setDepthImage(depth_img);
   // camera.setCamInWorld(cam_in_world);
 
   CUDAMatrixf3 point_cloud_img;
-  camera.computeCloud(point_cloud_img);
+  camera.computeCloud(depth_img, point_cloud_img);
   point_cloud_img.toHost();
   // check that depth value correspond to z of 3d point
   for (uint r = 0; r < point_cloud_img.rows(); ++r) {
@@ -91,11 +90,10 @@ TEST(INV_PROJECTION, RandomDepth) {
   Eigen::Matrix4f cam_in_world = Eigen::Matrix4f::Identity();
 
   Camera camera(d_cam_K, rows, cols, min_depth, max_depth);
-  camera.setDepthImage(depth_img);
   // camera.setCamInWorld(cam_in_world);
 
   CUDAMatrixf3 point_cloud_img, point_cloud_transformed;
-  camera.computeCloud(point_cloud_img);
+  camera.computeCloud(depth_img, point_cloud_img);
   transformCloud(point_cloud_img, Eig2CUDA(cam_in_world), point_cloud_transformed);
   point_cloud_transformed.toHost();
   // check that depth value correspond to z of 3d point
@@ -161,11 +159,10 @@ TEST(INV_PROJECTION_LIDAR, RandomDepth) {
   Eigen::Matrix4f cam_in_world = Eigen::Matrix4f::Identity();
 
   Camera camera(d_cam_K, rows, cols, min_depth, max_depth, Spherical);
-  camera.setDepthImage(depth_img);
   // camera.setCamInWorld(cam_in_world);
 
   CUDAMatrixf3 point_cloud_img, point_cloud_transformed;
-  camera.computeCloud(point_cloud_img);
+  camera.computeCloud(depth_img, point_cloud_img);
   transformCloud(point_cloud_img, Eig2CUDA(cam_in_world), point_cloud_transformed);
   point_cloud_transformed.toHost();
   // check that depth value correspond to z of 3d point

@@ -18,9 +18,9 @@ __global__ void calculateCloudKernel(const CUDAMatrixf* depth_img, const Camera*
   point_cloud_img->at<1>(row, col) = pcam;
 }
 
-void Camera::computeCloud(CUDAMatrixf3& point_cloud_img) {
-  point_cloud_img = CUDAMatrixf3(rows_, cols_);
+void Camera::computeCloud(const CUDAMatrixf& depth_img, CUDAMatrixf3& point_cloud_img) {
+  point_cloud_img.resize(rows_, cols_);
   point_cloud_img.fill(make_float3(0.f, 0.f, 0.f), true); // fill only in device
-  calculateCloudKernel<<<blocks_, threads_>>>(depth_img_.deviceInstance(), d_instance_, point_cloud_img.deviceInstance());
+  calculateCloudKernel<<<blocks_, threads_>>>(depth_img.deviceInstance(), d_instance_, point_cloud_img.deviceInstance());
   CUDA_CHECK(cudaDeviceSynchronize());
 }

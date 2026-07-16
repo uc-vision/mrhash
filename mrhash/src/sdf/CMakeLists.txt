@@ -34,5 +34,8 @@ target_link_libraries(${GEOM_LIB_NAME}
 
 target_compile_options(${GEOM_LIB_NAME} PRIVATE -lineinfo $<$<COMPILE_LANGUAGE:CUDA>: -v -g -lineinfo --expt-relaxed-constexpr>)
 
-set_target_properties(${GEOM_LIB_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(${GEOM_LIB_NAME} PROPERTIES
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  CUDA_SEPARABLE_COMPILATION ON
+)
 add_subdirectory(pybind)

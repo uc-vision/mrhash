@@ -15,6 +15,9 @@ namespace nb = nanobind;
 
 namespace pygeowrapper {
 
+  using CudaRGBImage = nb::ndarray<uint8_t, nb::shape<-1, -1, 3>, nb::pytorch, nb::device::cuda, nb::c_contig>;
+  using CudaDepthImage = nb::ndarray<float, nb::shape<-1, -1>, nb::pytorch, nb::device::cuda, nb::c_contig>;
+
   class GeoWrapper {
   private:
     int hash_num_buckets_;
@@ -43,6 +46,7 @@ namespace pygeowrapper {
 
     cupanutils::cugeoutils::CUDAMatrixf depth_img_;
     cupanutils::cugeoutils::CUDAMatrixuc3 rgb_img_;
+    bool images_on_device_ = false;
     cupanutils::cugeoutils::CUDAVectorf3 point_cloud_;
     cupanutils::cugeoutils::CUDAVectorf weights_;
     cupanutils::cugeoutils::CUDAVectorf3 eigenvectors_;
@@ -53,8 +57,6 @@ namespace pygeowrapper {
 
     std::unique_ptr<cupanutils::cugeoutils::GeometricGaussianContainer> gs_container_;
     std::string gs_optimization_param_path_;
-
-    cupanutils::cugeoutils::CUDAMatrixf view_depth_;
 
   public:
     ~GeoWrapper();
@@ -73,7 +75,9 @@ namespace pygeowrapper {
                const std::string& gs_optimization_param_path = default_gs_optimization_param_path,
                float sdf_var_threshold                       = default_sdf_var_threshold,
                float vertices_merging_threshold              = default_vertices_merging_threshold,
-               bool projective_sdf                           = default_projective_sdf);
+               bool projective_sdf                           = default_projective_sdf,
+               bool two_sided_surface_field                  = false,
+               bool allocate_mesh                            = true);
 
     // clang-format off
     int getHashNumBuckets() const { return hash_num_buckets_; }
@@ -95,6 +99,8 @@ namespace pygeowrapper {
     Eigen::MatrixX3f getPointCloud();
     Eigen::MatrixX3f getNormals();
     Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> getSurfaceVoxels(float surface_band);
+    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+    getTudfSurfaceVoxels(int partition_count = 1, int partition_index = 0);
     
     void setHashNumBuckets(int hash_num_buckets) { hash_num_buckets_ = hash_num_buckets; }
     void setNumSdfBlocks(int num_sdf_blocks) { num_sdf_blocks_ = num_sdf_blocks; }
@@ -154,6 +160,7 @@ namespace pygeowrapper {
      * @param input_rgb_array RGB image as a numpy array of dtype uint8_t
      */
     void setRGBImage(nb::ndarray<uint8_t> input_rgb_array);
+    void setRGBImageCUDA(CudaRGBImage input_rgb_array);
     /**
      * @brief Set the current input RGB image from OpenCV Mat
      *
@@ -166,6 +173,7 @@ namespace pygeowrapper {
      * @param input_depth_array Depth image as a numpy array of dtype float32
      */
     void setDepthImage(nb::ndarray<float> input_depth_array);
+    void setDepthImageCUDA(CudaDepthImage input_depth_array);
     /**
      * @brief Set the current input depth image from OpenCV Mat
      *

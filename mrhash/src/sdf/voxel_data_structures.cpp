@@ -33,7 +33,7 @@ namespace cupanutils {
       const uint size_d_hashDecision         = sizeof(int) * total_size_;
       const uint size_d_hashTableBucketMutex = sizeof(int) * hash_num_buckets_;
       const uint64_t size_d_hashTable        = sizeof(HashEntry) * total_size_;
-      const uint64_t size_d_compactHashTable = sizeof(HashEntry) * total_size_;
+      const uint64_t size_d_compactHashTable = sizeof(HashEntry) * num_sdf_blocks_;
       const uint64_t size_d_SDFBlocks        = sizeof(T) * num_sdf_blocks_ * voxel_block_volume_;
 
       out_file << "VoxelContainer | structs - size of Voxel: " << sizeof(T) << " | size of HashEntry: " << sizeof(HashEntry)
@@ -57,52 +57,20 @@ namespace cupanutils {
     }
 
     template <typename T>
-    void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::resetBuffers() {
-      int scaling_factor = 8;
-      uint* h_heap_high  = new uint[num_sdf_blocks_];
-      uint* h_heap_low   = new uint[num_sdf_blocks_ * scaling_factor];
-      for (uint i = 0; i < num_sdf_blocks_; i++) {
-        for (uint j = 0; j < scaling_factor; j++) {
-          h_heap_low[i * scaling_factor + j] = num_sdf_blocks_ * scaling_factor; // initialize to an invalid value
-        }
-        h_heap_high[i] = num_sdf_blocks_ - 1 - i;
-      }
-      CUDA_CHECK(cudaMemcpy(d_heap_high_, h_heap_high, sizeof(uint) * num_sdf_blocks_, cudaMemcpyHostToDevice));
-      CUDA_CHECK(cudaMemcpy(d_heap_low_, h_heap_low, sizeof(uint) * num_sdf_blocks_ * scaling_factor, cudaMemcpyHostToDevice));
-      delete[] h_heap_high;
-      delete[] h_heap_low;
-      T* h_SDFBlocks = new T[num_sdf_blocks_ * voxel_block_volume_];
-      CUDA_CHECK(
-        cudaMemcpy(d_SDFBlocks_, h_SDFBlocks, sizeof(T) * num_sdf_blocks_ * voxel_block_volume_, cudaMemcpyHostToDevice));
-      delete[] h_SDFBlocks;
-      HashEntry* h_hashTable = new HashEntry[total_size_];
-      CUDA_CHECK(cudaMemcpy(d_hashTable_, h_hashTable, sizeof(HashEntry) * total_size_, cudaMemcpyHostToDevice));
-      delete[] h_hashTable;
-      HashEntry* h_compactHashTable = new HashEntry[total_size_];
-      CUDA_CHECK(cudaMemcpy(d_compactHashTable_, h_compactHashTable, sizeof(HashEntry) * total_size_, cudaMemcpyHostToDevice));
-      delete[] h_compactHashTable;
-      int* h_hashTableBucketMutex = new int[hash_num_buckets_];
-      std::fill(h_hashTableBucketMutex, h_hashTableBucketMutex + hash_num_buckets_, FREE_ENTRY);
-      CUDA_CHECK(
-        cudaMemcpy(d_hashTableBucketMutex_, h_hashTableBucketMutex, sizeof(int) * hash_num_buckets_, cudaMemcpyHostToDevice));
-      delete[] h_hashTableBucketMutex;
-    }
-
-    template <typename T>
-    void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrate(const CUDAMatrixf3& point_cloud_img,
+    void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrate(const CUDAMatrixf& depth_img,
                                                                                     const CUDAMatrixuc3& rgb_img,
                                                                                     const Camera& camera,
                                                                                     const int max_num_frames) {
       {
         CUDAProfiler::CUDAEvent event(integration_profiler_);
-        allocBlocks(point_cloud_img, camera);
+        allocBlocks(depth_img, camera);
         flatAndReduceHashTable(camera);
-        integrateDepthMap(point_cloud_img, rgb_img, camera);
+        integrateDepthMap(depth_img, rgb_img, camera);
         if (sdf_var_threshold_ > 0.f && num_integrated_frames_ > 0) {
           checkVarSDF();
           reallocBlocks();
           flatAndReduceHashTable(camera);
-          reintegrateDepthMap(point_cloud_img, rgb_img, camera);
+          reintegrateDepthMap(depth_img, rgb_img, camera);
         }
         if (max_num_frames > 0)
           garbageCollect(camera, max_num_frames);

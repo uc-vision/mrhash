@@ -4,6 +4,7 @@
 #include <unordered_set>
 
 #include "test_utils.cuh"
+#include <sdf/streamer.cuh>
 #include <sdf/voxel_data_structures.cuh>
 
 using namespace cupanutils::cugeoutils;
@@ -189,6 +190,54 @@ constexpr uchar min_weight_threshold = 0;
 constexpr float sdf_var_threshold = 0.f;
 constexpr bool projective_sdf     = true;
 
+TEST(HASHTABLE, InsertsCollisionOverflow) {
+  constexpr int colliding_entries = hash_bucket_size + 1;
+  GeometricVoxelContainer voxelhasher(32,
+                                      2,
+                                      max_integration_distance,
+                                      sdf_truncation,
+                                      sdf_truncation_scale,
+                                      virtual_voxel_size,
+                                      integration_weight_sample,
+                                      min_weight_threshold,
+                                      sdf_var_threshold,
+                                      projective_sdf,
+                                      false,
+                                      "",
+                                      "",
+                                      "");
+  GeometricStreamer streamer(&voxelhasher, false, "", "");
+  streamer.create(Eigen::Vector3f::Ones(), colliding_entries, 0, false);
+
+  SDFBlockDesc descriptors[colliding_entries];
+  for (int index = 0; index < colliding_entries; ++index)
+    descriptors[index].pos = make_int3(index * 2, 0, 0);
+
+  SDFBlockDesc* device_descriptors;
+  uint* device_block_pointers;
+  uchar* device_merge_blocks;
+  CUDA_CHECK(cudaMalloc((void**) &device_descriptors, sizeof(descriptors)));
+  CUDA_CHECK(cudaMalloc((void**) &device_block_pointers, sizeof(uint) * colliding_entries));
+  CUDA_CHECK(cudaMalloc((void**) &device_merge_blocks, sizeof(uchar) * colliding_entries));
+  CUDA_CHECK(cudaMemcpy(device_descriptors, descriptors, sizeof(descriptors), cudaMemcpyHostToDevice));
+  streamer.chunkToGlobalHashPass1(
+    colliding_entries, 0, device_descriptors, device_block_pointers, device_merge_blocks);
+  CUDA_CHECK(cudaFree(device_descriptors));
+  CUDA_CHECK(cudaFree(device_block_pointers));
+  CUDA_CHECK(cudaFree(device_merge_blocks));
+
+  HashEntry hash_table[2 * hash_bucket_size];
+  CUDA_CHECK(cudaMemcpy(hash_table, voxelhasher.d_hashTable_, sizeof(hash_table), cudaMemcpyDeviceToHost));
+  std::unordered_set<int> positions;
+  for (const HashEntry& entry : hash_table) {
+    if (entry.ptr != FREE_ENTRY)
+      positions.insert(entry.pos.x);
+  }
+  EXPECT_EQ(positions.size(), colliding_entries);
+  for (int index = 0; index < colliding_entries; ++index)
+    EXPECT_EQ(positions.count(index * 2), 1);
+}
+
 TEST(HASHTABLE, AllocationDeletion) {
   srand(time(NULL));
   uint rows = 400;
@@ -209,12 +258,8 @@ TEST(HASHTABLE, AllocationDeletion) {
   CUDAMat3 d_cam_K(cam_K);
 
   Camera camera(d_cam_K, rows, cols, min_depth, max_depth);
-  camera.setDepthImage(depth_img);
-
   Eigen::Matrix4f cam_in_world = Eigen::Matrix4f::Identity();
   camera.setCamInWorld(cam_in_world);
-  CUDAMatrixf3 point_cloud_img;
-  camera.computeCloud(point_cloud_img);
 
   GeometricVoxelContainer voxelhasher(num_sdf_blocks,
                                       hash_num_buckets,
@@ -238,7 +283,7 @@ TEST(HASHTABLE, AllocationDeletion) {
   uchar3 rgb = make_uchar3(255, 0, 0);
   rgb_img.fill(rgb);
 
-  voxelhasher.integrate(point_cloud_img, rgb_img, camera, 0);
+  voxelhasher.integrate(depth_img, rgb_img, camera, 0);
 
   std::cerr << "setting sdf weights to zero and let garbage collector should select the elements for removal" << std::endl;
   // resetting heap and make drop weights sdf blocks
@@ -394,12 +439,8 @@ TEST(HASHTABLE, HeapSanityCheck) {
   CUDAMat3 d_cam_K(cam_K);
 
   Camera camera(d_cam_K, rows, cols, min_depth, max_depth);
-  camera.setDepthImage(depth_img);
-
   Eigen::Matrix4f cam_in_world = Eigen::Matrix4f::Identity();
   camera.setCamInWorld(cam_in_world);
-  CUDAMatrixf3 point_cloud_img;
-  camera.computeCloud(point_cloud_img);
 
   GeometricVoxelContainer voxelhasher(num_sdf_blocks,
                                       hash_num_buckets,
@@ -422,7 +463,7 @@ TEST(HASHTABLE, HeapSanityCheck) {
   uchar3 rgb = make_uchar3(255, 0, 0);
   rgb_img.fill(rgb);
 
-  voxelhasher.integrate(point_cloud_img, rgb_img, camera, 0);
+  voxelhasher.integrate(depth_img, rgb_img, camera, 0);
 
   HashEntry* h_hashTable = new HashEntry[voxelhasher.total_size_];
   uint* h_heap           = new uint[voxelhasher.num_sdf_blocks_];

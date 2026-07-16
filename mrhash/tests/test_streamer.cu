@@ -54,7 +54,6 @@ TEST(STREAMER, SingleStream) {
   CUDAMat3 d_cam_K(cam_K);
 
   Camera camera(d_cam_K, rows, cols, min_depth, max_depth);
-  camera.setDepthImage(depth_img);
 
   Eigen::Matrix4f cam_in_world = Eigen::Matrix4f::Identity();
   camera.setCamInWorld(cam_in_world);
@@ -77,7 +76,7 @@ TEST(STREAMER, SingleStream) {
   GeometricStreamer streamer(&voxelhasher, false, "memory_allocation.txt", "streamer");
   const Eigen::Vector3f voxel_extents = Eigen::Vector3f::Ones();
   uint initial_chunk_list_size        = 0;
-  streamer.create(voxel_extents, max_num_sdf_block_integrate_from_global_hash, initial_chunk_list_size);
+  streamer.create(voxel_extents, max_num_sdf_block_integrate_from_global_hash, initial_chunk_list_size, true);
   // simulate a circular path
   auto path = makeCameraCircularTrajectory(translation_step, steps);
 
@@ -85,13 +84,9 @@ TEST(STREAMER, SingleStream) {
     // set camera motion
     const auto& T = path[i];
     camera.setCamInWorld(T.matrix());
-    // inverse projection to get point cloud once
-    CUDAMatrixf3 point_cloud_img;
-    camera.computeCloud(point_cloud_img);
-
     Eigen::Vector3f cam_pose_in_world = T.translation();
     streamer.stream(cam_pose_in_world, max_radius_for_stream);
-    voxelhasher.integrate(point_cloud_img, rgb_img, camera, n_frames_invalidate_voxels);
+    voxelhasher.integrate(depth_img, rgb_img, camera, n_frames_invalidate_voxels);
     streamer.debugCheckForDuplicates();
   }
 
@@ -101,17 +96,37 @@ TEST(STREAMER, SingleStream) {
     // set camera motion
     const auto& T = path[i];
     camera.setCamInWorld(T.matrix());
-    // inverse projection to get point cloud once
-    CUDAMatrixf3 point_cloud_img;
-    camera.computeCloud(point_cloud_img);
-
     Eigen::Vector3f cam_pose_in_world = T.translation();
     streamer.stream(cam_pose_in_world, max_radius_for_stream);
     duplicates_ratio = streamer.debugCheckForDuplicates();
   }
 
+  const std::vector<Eigen::Vector3i> chunks = streamer.chunks();
+  const int free_blocks_before_discard = voxelhasher.getHeapHighFreeCount();
+  streamer.discardChunks(chunks);
+  ASSERT_GT(voxelhasher.getHeapHighFreeCount(), free_blocks_before_discard);
+
   streamer.streamAllOut();
   streamer.printStatistics();
 
   ASSERT_LT(duplicates_ratio, 0.15);
+}
+
+TEST(STREAMER, CompactBlocksMergeByPosition) {
+  ChunkDesc<Voxel> chunk(0, true);
+  SDFBlockDesc descriptor;
+  descriptor.pos = make_int3(4, 5, 6);
+  std::vector<CompactVoxel> first(total_sdf_block_size);
+  std::vector<CompactVoxel> second(total_sdf_block_size);
+  const ushort first_sdf = __half_as_ushort(__float2half(0.002f));
+  const ushort second_sdf = __half_as_ushort(__float2half(-0.001f));
+  first[0] = CompactVoxel{static_cast<uchar>(first_sdf), static_cast<uchar>(first_sdf >> 8), 2};
+  second[0] = CompactVoxel{static_cast<uchar>(second_sdf), static_cast<uchar>(second_sdf >> 8), 1};
+
+  chunk.addCompactSDFBlock(descriptor, first.data());
+  chunk.addCompactSDFBlock(descriptor, second.data());
+
+  EXPECT_EQ(chunk.getNElements(), 1);
+  EXPECT_EQ(chunk.getVoxel(0, 0).weight, 3);
+  EXPECT_NEAR(chunk.getVoxel(0, 0).sdf, 0.001f, 2e-6f);
 }

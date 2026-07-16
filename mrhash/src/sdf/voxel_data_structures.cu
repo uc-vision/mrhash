@@ -8,10 +8,75 @@
 namespace cupanutils {
   namespace cugeoutils {
 
+    constexpr float tudf_min_sample_distance_voxels = 0.25f;
+    constexpr float tudf_min_gradient = 0.25f;
+    constexpr float tudf_min_interpolation_support = 1.f;
+    constexpr float tudf_projection_distance_voxels = 0.75f;
+    constexpr float tudf_max_relative_variance = 1.f;
+    constexpr float tudf_half_cell_diagonal = 0.8660254037844386f;
+    constexpr float tudf_promoted_candidate_radius = 0.4f;
+    constexpr float tudf_completed_candidate_radius = 0.5f;
+    constexpr int tudf_max_connector_coordinate_span = 5;
+    constexpr float tudf_min_connector_normal_alignment = 0.5f;
+    constexpr float tudf_min_fill_normal_alignment = 0.7071067811865476f;
+    constexpr int tudf_min_completion_neighbors = 3;
+    constexpr uint tudf_extraction_threads = 256;
+
+    enum class TudfSampleSupport : int {
+      completed = -2,
+      promoted = -1,
+      observed = 0,
+    };
+
+    enum class TudfFieldValue {
+      distance,
+      mean,
+      second_moment,
+    };
+
+    __global__ void initializeVoxelContainerBuffersKernel(const uint num_sdf_blocks,
+                                                           const uint total_size,
+                                                           const uint hash_num_buckets,
+                                                           uint* heap_high,
+                                                           uint* heap_low,
+                                                           HashEntry* hash_table,
+                                                           HashEntry* compact_hash_table,
+                                                           int* hash_table_bucket_mutex) {
+      const uint index = blockIdx.x * blockDim.x + threadIdx.x;
+      const uint low_heap_size = num_sdf_blocks * octree_branching_factor;
+      if (index < num_sdf_blocks) {
+        heap_high[index] = num_sdf_blocks - 1 - index;
+        compact_hash_table[index] = HashEntry();
+      }
+      if (index < low_heap_size)
+        heap_low[index] = low_heap_size;
+      if (index < total_size)
+        hash_table[index] = HashEntry();
+      if (index < hash_num_buckets)
+        hash_table_bucket_mutex[index] = FREE_ENTRY;
+    }
+
+    template <typename T>
+    void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::resetBuffers() {
+      const uint initialization_size = std::max(total_size_, num_sdf_blocks_ * octree_branching_factor);
+      const dim3 threads_per_block(n_threads_reduce_hashtable, 1);
+      const dim3 blocks((initialization_size + threads_per_block.x - 1) / threads_per_block.x, 1);
+      initializeVoxelContainerBuffersKernel<<<blocks, threads_per_block>>>(num_sdf_blocks_,
+                                                                           total_size_,
+                                                                           hash_num_buckets_,
+                                                                           d_heap_high_,
+                                                                           d_heap_low_,
+                                                                           d_hashTable_,
+                                                                           d_compactHashTable_,
+                                                                           d_hashTableBucketMutex_);
+      CUDA_CHECK(cudaMemset(d_SDFBlocks_, 0, sizeof(T) * num_sdf_blocks_ * voxel_block_volume_));
+      CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
     template <typename T>
     __global__ void resetCompactHashTableKernel(const VoxelContainer<T>* container) {
       const uint idx = blockIdx.x * blockDim.x + threadIdx.x;
-      if (idx >= container->total_size_)
+      if (idx >= container->num_sdf_blocks_)
         return;
       deleteHashEntry(container->d_compactHashTable_[idx]);
     }
@@ -29,7 +94,6 @@ namespace cupanutils {
       const dim3 threads_per_block((n_threads * n_threads), 1);
       const dim3 n_blocks((hash_num_buckets_ + threads_per_block.x - 1) / threads_per_block.x, 1);
       resetHashBucketMutexKernel<<<n_blocks, threads_per_block>>>(d_instance_);
-      CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     template <typename T>
@@ -440,13 +504,12 @@ namespace cupanutils {
     void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::flatAndReduceHashTable(const Camera& camera) {
       const dim3 threads_per_block(n_threads_reduce_hashtable, 1);
       const dim3 n_blocks((total_size_ + threads_per_block.x - 1) / threads_per_block.x, 1);
+      const dim3 compact_blocks((num_sdf_blocks_ + threads_per_block.x - 1) / threads_per_block.x, 1);
 
-      resetCompactHashTableKernel<<<n_blocks, threads_per_block>>>(d_instance_);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      resetCompactHashTableKernel<<<compact_blocks, threads_per_block>>>(d_instance_);
       CUDA_CHECK(cudaMemset(d_compactHashCounter_, 0, sizeof(int)));
 
       flatAndReduceHashTableKernel<<<n_blocks, threads_per_block>>>(camera.deviceInstance(), d_instance_);
-      CUDA_CHECK(cudaDeviceSynchronize());
       CUDA_CHECK(cudaMemcpy(&current_occupied_blocks_, &d_compactHashCounter_[0], sizeof(uint), cudaMemcpyDeviceToHost));
       CUDA_CHECK(cudaMemcpy(d_instance_, this, sizeof(VoxelContainer), cudaMemcpyHostToDevice));
     }
@@ -489,13 +552,12 @@ namespace cupanutils {
     void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::flatAndReduceHashTable() {
       const dim3 threads_per_block(n_threads_reduce_hashtable, 1);
       const dim3 n_blocks((total_size_ + threads_per_block.x - 1) / threads_per_block.x, 1);
+      const dim3 compact_blocks((num_sdf_blocks_ + threads_per_block.x - 1) / threads_per_block.x, 1);
 
-      resetCompactHashTableKernel<<<n_blocks, threads_per_block>>>(d_instance_);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      resetCompactHashTableKernel<<<compact_blocks, threads_per_block>>>(d_instance_);
       CUDA_CHECK(cudaMemset(d_compactHashCounter_, 0, sizeof(int)));
 
       flatAndReduceHashTableKernel<<<n_blocks, threads_per_block>>>(d_instance_);
-      CUDA_CHECK(cudaDeviceSynchronize());
       CUDA_CHECK(cudaMemcpy(&current_occupied_blocks_, &d_compactHashCounter_[0], sizeof(uint), cudaMemcpyDeviceToHost));
       // copy current ptr to gpu, make sure current_occupied_blocks_ is updated in gpu
       CUDA_CHECK(cudaMemcpy(d_instance_, this, sizeof(VoxelContainer), cudaMemcpyHostToDevice));
@@ -594,6 +656,901 @@ namespace cupanutils {
       CUDA_CHECK(cudaFree(d_offsets));
       if (d_voxels != nullptr)
         CUDA_CHECK(cudaFree(d_voxels));
+      return surface_voxels;
+    }
+
+    __device__ int floorHalfCoordinate(const int coordinate) {
+      return coordinate >= 0 ? coordinate / 2 : -((-coordinate + 1) / 2);
+    }
+
+    template <TudfSampleSupport sample_support, TudfFieldValue field_value, typename T>
+    __device__ bool sampleTudfImpl(
+      const VoxelContainer<T>* container,
+      const int3 half_position,
+      float& distance) {
+      const int3 lower = make_int3(
+        floorHalfCoordinate(half_position.x),
+        floorHalfCoordinate(half_position.y),
+        floorHalfCoordinate(half_position.z));
+      const float3 fraction = 0.5f * make_float3(half_position - 2 * lower);
+      distance = 0.f;
+      float interpolation_support = 0.f;
+      for (int z = 0; z <= (fraction.z > 0.f); ++z) {
+        for (int y = 0; y <= (fraction.y > 0.f); ++y) {
+          for (int x = 0; x <= (fraction.x > 0.f); ++x) {
+            const float coefficient =
+              (x == 0 ? 1.f - fraction.x : fraction.x) *
+              (y == 0 ? 1.f - fraction.y : fraction.y) *
+              (z == 0 ? 1.f - fraction.z : fraction.z);
+            const T voxel = container->getVoxel(lower + make_int3(x, y, z));
+            if (twoSidedSurfaceWeight(voxel) >= container->min_weight_threshold_ &&
+                voxel.sum_squared >= static_cast<int>(sample_support)) {
+              float value;
+              if constexpr (field_value == TudfFieldValue::distance)
+                value = twoSidedSurfaceDistance(voxel);
+              else if constexpr (field_value == TudfFieldValue::mean)
+                value = voxel.sdf;
+              else
+                value = voxel.sum_squared;
+              distance += coefficient * value;
+              interpolation_support += coefficient;
+            }
+          }
+        }
+      }
+      if (interpolation_support < tudf_min_interpolation_support)
+        return false;
+      distance /= interpolation_support;
+      return true;
+    }
+
+    template <TudfSampleSupport sample_support, typename T>
+    __device__ bool sampleTudf(
+      const VoxelContainer<T>* container, const int3 half_position, float& distance) {
+      return sampleTudfImpl<sample_support, TudfFieldValue::distance>(container, half_position, distance);
+    }
+
+    template <TudfSampleSupport sample_support, typename T>
+    __device__ bool sampleTudfMean(
+      const VoxelContainer<T>* container, const int3 half_position, float& distance) {
+      return sampleTudfImpl<sample_support, TudfFieldValue::mean>(container, half_position, distance);
+    }
+
+    template <TudfSampleSupport sample_support, typename T>
+    __device__ bool sampleTudfSecondMoment(
+      const VoxelContainer<T>* container, const int3 half_position, float& second_moment) {
+      return sampleTudfImpl<sample_support, TudfFieldValue::second_moment>(
+        container, half_position, second_moment);
+    }
+
+    template <typename T>
+    __device__ bool tudfGradient(
+      const VoxelContainer<T>* container, const int3 half_position, const int scale, float3& gradient) {
+      gradient = make_float3(0.f);
+      for (int axis = 0; axis < 3; ++axis) {
+        const int3 direction = scale * basisVector(axis);
+        float negative;
+        float positive;
+        if (!sampleTudf<TudfSampleSupport::completed>(container, half_position - direction, negative) ||
+            !sampleTudf<TudfSampleSupport::completed>(container, half_position + direction, positive))
+          return false;
+        gradient += (positive - negative) / (scale * container->virtual_voxel_size_) *
+                    make_float3(basisVector(axis));
+      }
+      return true;
+    }
+
+    template <typename T>
+    __device__ bool isTudfProjectionValid(
+      const VoxelContainer<T>* container, const float3 projection, const int scale) {
+      const int3 half_position = worldPointToVirtualVoxelPos(
+        0.5f * container->virtual_voxel_size_, projection);
+      float distance;
+      return sampleTudf<TudfSampleSupport::completed>(container, half_position, distance) &&
+             distance <= tudf_projection_distance_voxels * scale * container->virtual_voxel_size_;
+    }
+
+    template <typename T>
+    __device__ bool isTudfCandidateCell(
+      const VoxelContainer<T>* container,
+      const int3 position,
+      const int scale,
+      float& mean_distance_voxels) {
+      float center_distance;
+      const int3 center_half_position = 2 * position + make_int3(scale);
+      bool candidate = false;
+      if (sampleTudf<TudfSampleSupport::observed>(container, center_half_position, center_distance))
+        candidate = center_distance <= tudf_half_cell_diagonal * scale * container->virtual_voxel_size_;
+      else if (sampleTudf<TudfSampleSupport::promoted>(container, center_half_position, center_distance))
+        candidate = center_distance <= tudf_promoted_candidate_radius * scale * container->virtual_voxel_size_;
+      else if (sampleTudf<TudfSampleSupport::completed>(container, center_half_position, center_distance))
+        candidate = center_distance <= tudf_completed_candidate_radius * scale * container->virtual_voxel_size_;
+      float mean_distance;
+      if (!candidate ||
+          !sampleTudfMean<TudfSampleSupport::completed>(container, center_half_position, mean_distance))
+        return false;
+      float observed_mean;
+      float observed_second_moment;
+      if (sampleTudfMean<TudfSampleSupport::observed>(container, center_half_position, observed_mean) &&
+          sampleTudfSecondMoment<TudfSampleSupport::observed>(
+            container, center_half_position, observed_second_moment) &&
+          observed_second_moment - observed_mean * observed_mean >
+            tudf_max_relative_variance * observed_mean * observed_mean)
+        return false;
+      mean_distance_voxels = mean_distance / container->virtual_voxel_size_;
+      return true;
+    }
+
+    __device__ int dominantAxis(const float3 vector) {
+      const float3 magnitude = fabs(vector);
+      if (magnitude.x >= magnitude.y && magnitude.x >= magnitude.z)
+        return 0;
+      return magnitude.y >= magnitude.z ? 1 : 2;
+    }
+
+    struct TudfSurfaceEstimate {
+      int3 position;
+      float3 normal;
+      float density;
+      float mean_distance_voxels;
+    };
+
+    struct TudfSurfaceCache {
+      int coordinate;
+      uint packed_normal;
+      ushort mean_distance;
+      uchar density;
+      uchar state;
+    };
+    static_assert(sizeof(TudfSurfaceCache) == 12);
+
+    __device__ uint packTudfNormal(const float3 normal) {
+      const uint3 encoded = make_uint3(clamp(0.5f * normal + 0.5f, 0.f, 1.f) * 1023.f + 0.5f);
+      return encoded.x | (encoded.y << 10) | (encoded.z << 20);
+    }
+
+    __device__ float3 unpackTudfNormal(const uint packed) {
+      const uint3 encoded = make_uint3(packed & 1023, (packed >> 10) & 1023, (packed >> 20) & 1023);
+      return normalize(2.f * make_float3(encoded) / 1023.f - 1.f);
+    }
+
+    __device__ TudfSurfaceCache cacheTudfSurface(
+      const TudfSurfaceEstimate surface, const uchar state) {
+      const int normal_axis = dominantAxis(surface.normal);
+      return {
+        component(surface.position, normal_axis),
+        packTudfNormal(surface.normal) | (normal_axis << 30),
+        static_cast<ushort>(__float2uint_rn(16384.f * surface.mean_distance_voxels)),
+        static_cast<uchar>(__float2uint_rn(surface.density)),
+        state,
+      };
+    }
+
+    __device__ TudfSurfaceEstimate unpackTudfSurface(
+      const TudfSurfaceCache cached, const int3 cell_position) {
+      const float3 normal = unpackTudfNormal(cached.packed_normal);
+      return {
+        withComponent(cell_position, cached.packed_normal >> 30, cached.coordinate),
+        normal,
+        static_cast<float>(cached.density),
+        cached.mean_distance / 16384.f,
+      };
+    }
+
+    template <typename T>
+    __device__ float tudfCellDensity(
+      const VoxelContainer<T>* container, const int3 position, const int scale) {
+      float density = 0.f;
+      for (int z = 0; z < 2; ++z)
+        for (int y = 0; y < 2; ++y)
+          for (int x = 0; x < 2; ++x)
+            density += twoSidedSurfaceWeight(
+              container->getVoxel(position + scale * make_int3(x, y, z)));
+      return density / 8.f;
+    }
+
+    template <typename T>
+    __device__ bool solveObservedTudfSurfaceCell(const VoxelContainer<T>* container,
+                                                 const int3 position,
+                                                 const int scale,
+                                                 TudfSurfaceEstimate& surface) {
+      if (!isTudfCandidateCell(container, position, scale, surface.mean_distance_voxels))
+        return false;
+
+      const float voxel_size = scale * container->virtual_voxel_size_;
+      TudfQef qef;
+      for (int z = 0; z < 3; ++z) {
+        for (int y = 0; y < 3; ++y) {
+          for (int x = 0; x < 3; ++x) {
+            const int3 half_position = 2 * position + scale * make_int3(x, y, z);
+            float distance;
+            float3 gradient;
+            if (!sampleTudf<TudfSampleSupport::completed>(container, half_position, distance) ||
+                distance < tudf_min_sample_distance_voxels * voxel_size ||
+                !tudfGradient(container, half_position, scale, gradient))
+              continue;
+            const float gradient_magnitude = length(gradient);
+            if (gradient_magnitude < tudf_min_gradient)
+              continue;
+            const float3 normal = gradient / gradient_magnitude;
+            const float3 sample_point =
+              0.5f * container->virtual_voxel_size_ * make_float3(half_position);
+            const float3 projection = sample_point - distance * normal;
+            if (isTudfProjectionValid(container, projection, scale))
+              addTudfPlane(qef, normal, projection);
+          }
+        }
+      }
+      const float3 center = virtualVoxelPosToWorld(
+        container->virtual_voxel_size_, make_float3(position) + 0.5f * scale);
+      float3 surface_point;
+      float3 surface_direction;
+      if (qef.plane_count < 3)
+        return false;
+      if (solveTudfQef(qef, center, surface_point, surface.normal, surface_direction) == 0)
+        return false;
+      surface.position = position;
+      const int normal_axis = dominantAxis(surface.normal);
+      const int3 qef_position = worldPointToVirtualVoxelPos(container->virtual_voxel_size_, surface_point);
+      surface.position = withComponent(surface.position, normal_axis, component(qef_position, normal_axis));
+      surface.density = tudfCellDensity(container, position, scale);
+      return true;
+    }
+
+    __device__ int3 tudfCellPosition(const HashEntry& entry, const uint voxel_idx) {
+      return SDFBlockToVirtualVoxelPos(entry.pos) + make_int3(delinearizeVoxelPos(voxel_idx));
+    }
+
+    template <typename T>
+    __device__ bool getCachedTudfSurface(const VoxelContainer<T>* container,
+                                         const TudfSurfaceCache* cache,
+                                         const uint* block_to_compact,
+                                         const int3 cell_position,
+                                         const uchar source_state,
+                                         TudfSurfaceEstimate& surface) {
+      const HashEntry entry = container->getHashEntry(
+        virtualVoxelPosToSDFBlock(cell_position, container->virtual_voxel_size_, container->voxel_extents_));
+      if (entry.ptr == FREE_ENTRY)
+        return false;
+      const uint compact_index = block_to_compact[entry.ptr / total_sdf_block_size];
+      if (compact_index == UINT_MAX)
+        return false;
+      const uint voxel_idx = virtualVoxelPosToSDFBlockIndex(cell_position);
+      const TudfSurfaceCache cached = cache[compact_index * total_sdf_block_size + voxel_idx];
+      const uchar state = cached.state & 0x7f;
+      if (state == 0 || state > source_state)
+        return false;
+      surface = unpackTudfSurface(cached, tudfCellPosition(entry, voxel_idx));
+      return true;
+    }
+
+    template <typename T>
+    __global__ void initializeTudfSurfaceCacheKernel(VoxelContainer<T>* container,
+                                                     TudfSurfaceCache* cache,
+                                                     uint* block_to_compact) {
+      const uint compact_index = blockIdx.x;
+      const HashEntry& entry = container->d_compactHashTable_[compact_index];
+      if (threadIdx.x == 0)
+        block_to_compact[entry.ptr / total_sdf_block_size] = compact_index;
+      for (uint voxel_idx = threadIdx.x; voxel_idx < total_sdf_block_size; voxel_idx += blockDim.x) {
+        TudfSurfaceEstimate surface;
+        TudfSurfaceCache& cached = cache[compact_index * total_sdf_block_size + voxel_idx];
+        cached.state = 0;
+        if (solveObservedTudfSurfaceCell(container, tudfCellPosition(entry, voxel_idx), 1, surface))
+          cached = cacheTudfSurface(surface, 1);
+      }
+    }
+
+    template <typename T>
+    __global__ void markNonminimalTudfSurfacesKernel(const VoxelContainer<T>* container,
+                                                     TudfSurfaceCache* cache,
+                                                     const uint* block_to_compact) {
+      const uint compact_index = blockIdx.x;
+      const HashEntry& entry = container->d_compactHashTable_[compact_index];
+      for (uint voxel_idx = threadIdx.x; voxel_idx < total_sdf_block_size; voxel_idx += blockDim.x) {
+        TudfSurfaceCache& cached = cache[compact_index * total_sdf_block_size + voxel_idx];
+        if ((cached.state & 0x7f) != 1)
+          continue;
+        const int3 cell_position = tudfCellPosition(entry, voxel_idx);
+        const TudfSurfaceEstimate surface = unpackTudfSurface(cached, cell_position);
+        const int normal_axis = cached.packed_normal >> 30;
+        for (int side = -1; side <= 1; side += 2) {
+          TudfSurfaceEstimate neighbor;
+          if (!getCachedTudfSurface(
+                container,
+                cache,
+                block_to_compact,
+                cell_position + side * basisVector(normal_axis),
+                1,
+                neighbor) ||
+              fabsf(dot(surface.normal, neighbor.normal)) < tudf_min_fill_normal_alignment ||
+              maxComponent(abs(surface.position - neighbor.position)) > tudf_max_connector_coordinate_span)
+            continue;
+          if (neighbor.mean_distance_voxels < surface.mean_distance_voxels) {
+            cached.state |= 0x80;
+            break;
+          }
+        }
+      }
+    }
+
+    __global__ void removeMarkedTudfSurfacesKernel(TudfSurfaceCache* cache) {
+      const uint compact_index = blockIdx.x;
+      for (uint voxel_idx = threadIdx.x; voxel_idx < total_sdf_block_size; voxel_idx += blockDim.x) {
+        TudfSurfaceCache& cached = cache[compact_index * total_sdf_block_size + voxel_idx];
+        if ((cached.state & 0x80) != 0)
+          cached.state = 0;
+      }
+    }
+
+    __device__ bool appendTudfEstimate(const TudfSurfaceEstimate candidate,
+                                       const int normal_axis,
+                                       TudfSurfaceEstimate* estimates,
+                                       int& count) {
+      if (dominantAxis(candidate.normal) != normal_axis ||
+          (count > 0 && fabsf(dot(estimates[0].normal, candidate.normal)) < tudf_min_fill_normal_alignment))
+        return false;
+      estimates[count++] = candidate;
+      return true;
+    }
+
+    __device__ int medianCoordinate(int* coordinates, const int count) {
+      for (int index = 1; index < count; ++index) {
+        const int value = coordinates[index];
+        int insertion = index;
+        while (insertion > 0 && coordinates[insertion - 1] > value) {
+          coordinates[insertion] = coordinates[insertion - 1];
+          --insertion;
+        }
+        coordinates[insertion] = value;
+      }
+      const int middle = count / 2;
+      return count % 2 == 0
+               ? __float2int_rn(0.5f * (coordinates[middle - 1] + coordinates[middle]))
+               : coordinates[middle];
+    }
+
+    __device__ bool hasOpposingPair(const bool accepted[4]) {
+      return (accepted[0] && accepted[1]) || (accepted[2] && accepted[3]);
+    }
+
+    template <typename T>
+    __global__ void smoothUnderobservedTudfSurfacesKernel(const VoxelContainer<T>* container,
+                                                          TudfSurfaceCache* cache,
+                                                          const uint* block_to_compact) {
+      const uint compact_index = blockIdx.x;
+      const HashEntry& entry = container->d_compactHashTable_[compact_index];
+      const float well_observed_density = container->min_weight_threshold_ + 1.f;
+      for (uint voxel_idx = threadIdx.x; voxel_idx < total_sdf_block_size; voxel_idx += blockDim.x) {
+        TudfSurfaceCache& cached = cache[compact_index * total_sdf_block_size + voxel_idx];
+        if (cached.state != 1 || cached.density >= well_observed_density)
+          continue;
+        const int3 cell_position = tudfCellPosition(entry, voxel_idx);
+        const TudfSurfaceEstimate surface = unpackTudfSurface(cached, cell_position);
+        const int normal_axis = cached.packed_normal >> 30;
+        const int first_axis = (normal_axis + 1) % 3;
+        const int second_axis = (normal_axis + 2) % 3;
+        int coordinates[8];
+        int coordinate_count = 0;
+        for (int first_offset = -1; first_offset <= 1; ++first_offset) {
+          for (int second_offset = -1; second_offset <= 1; ++second_offset) {
+            if (first_offset == 0 && second_offset == 0)
+              continue;
+            const int3 offset = first_offset * basisVector(first_axis) +
+                                second_offset * basisVector(second_axis);
+            TudfSurfaceEstimate neighbor;
+            if (getCachedTudfSurface(
+                  container,
+                  cache,
+                  block_to_compact,
+                  cell_position + offset,
+                  1,
+                  neighbor) &&
+                neighbor.density >= well_observed_density &&
+                dominantAxis(neighbor.normal) == normal_axis &&
+                fabsf(dot(surface.normal, neighbor.normal)) >= tudf_min_fill_normal_alignment)
+              coordinates[coordinate_count++] = component(neighbor.position, normal_axis);
+          }
+        }
+        if (coordinate_count < 3)
+          continue;
+        const int coordinate = medianCoordinate(coordinates, coordinate_count);
+        if (coordinates[coordinate_count - 1] - coordinates[0] <= tudf_max_connector_coordinate_span)
+          cached.coordinate = coordinate;
+      }
+    }
+
+    template <typename T>
+    __device__ bool fillCachedTudfSurfaceCell(const VoxelContainer<T>* container,
+                                              const TudfSurfaceCache* cache,
+                                              const uint* block_to_compact,
+                                              const int3 position,
+                                              const uchar source_state,
+                                              const bool require_opposing_support,
+                                              TudfSurfaceEstimate& surface) {
+      bool valid[6];
+      TudfSurfaceEstimate axial_estimates[6];
+      for (int axis = 0; axis < 3; ++axis) {
+        for (int side = 0; side < 2; ++side) {
+          const int3 direction = (2 * side - 1) * basisVector(axis);
+          const int neighbor = 2 * axis + side;
+          valid[neighbor] = getCachedTudfSurface(
+            container,
+            cache,
+            block_to_compact,
+            position + direction,
+            source_state,
+            axial_estimates[neighbor]);
+        }
+      }
+
+      for (int normal_axis = 0; normal_axis < 3; ++normal_axis) {
+        const int first_axis = (normal_axis + 1) % 3;
+        const int second_axis = (normal_axis + 2) % 3;
+        const int neighbors[4] = {2 * first_axis, 2 * first_axis + 1, 2 * second_axis, 2 * second_axis + 1};
+        TudfSurfaceEstimate estimates[8];
+        bool axial_accepted[4] = {};
+        int estimate_count = 0;
+        for (int index = 0; index < 4; ++index) {
+          const int neighbor = neighbors[index];
+          if (valid[neighbor])
+            axial_accepted[index] = appendTudfEstimate(
+              axial_estimates[neighbor], normal_axis, estimates, estimate_count);
+        }
+        bool opposing_support = hasOpposingPair(axial_accepted);
+        if (estimate_count < 3) {
+          bool diagonal_accepted[4] = {};
+          int diagonal_index = 0;
+          for (int first_side = -1; first_side <= 1; first_side += 2) {
+            for (int second_side = -1; second_side <= 1; second_side += 2) {
+              const int3 offset = first_side * basisVector(first_axis) +
+                                  second_side * basisVector(second_axis);
+              TudfSurfaceEstimate diagonal;
+              if (getCachedTudfSurface(
+                    container,
+                    cache,
+                    block_to_compact,
+                    position + offset,
+                    source_state,
+                    diagonal))
+                diagonal_accepted[diagonal_index] = appendTudfEstimate(
+                  diagonal, normal_axis, estimates, estimate_count);
+              ++diagonal_index;
+            }
+          }
+          opposing_support |= hasOpposingPair(diagonal_accepted);
+        }
+        if (estimate_count < 2 || (require_opposing_support ? !opposing_support : estimate_count < 3))
+          continue;
+
+        int coordinates[8];
+        for (int index = 0; index < estimate_count; ++index)
+          coordinates[index] = component(estimates[index].position, normal_axis);
+        const int surface_coordinate = medianCoordinate(coordinates, estimate_count);
+        const int maximum_span = require_opposing_support ? 1 : 2;
+        if (coordinates[estimate_count - 1] - coordinates[0] > maximum_span)
+          continue;
+
+        surface.position = withComponent(position, normal_axis, surface_coordinate);
+        surface.normal = estimates[0].normal;
+        surface.density = estimates[0].density;
+        surface.mean_distance_voxels = estimates[0].mean_distance_voxels;
+        for (int index = 1; index < estimate_count; ++index) {
+          surface.normal += copysignf(1.f, dot(surface.normal, estimates[index].normal)) *
+                            estimates[index].normal;
+          surface.density += estimates[index].density;
+          surface.mean_distance_voxels += estimates[index].mean_distance_voxels;
+        }
+        surface.normal = normalize(surface.normal);
+        surface.density /= estimate_count;
+        surface.mean_distance_voxels /= estimate_count;
+        return true;
+      }
+      return false;
+    }
+
+    template <typename T>
+    __global__ void fillTudfSurfaceCacheKernel(const VoxelContainer<T>* container,
+                                               TudfSurfaceCache* cache,
+                                               const uint* block_to_compact,
+                                               const uchar source_state,
+                                               const bool require_opposing_support) {
+      const uint compact_index = blockIdx.x;
+      const HashEntry& entry = container->d_compactHashTable_[compact_index];
+      for (uint voxel_idx = threadIdx.x; voxel_idx < total_sdf_block_size; voxel_idx += blockDim.x) {
+        TudfSurfaceCache& cached = cache[compact_index * total_sdf_block_size + voxel_idx];
+        if (cached.state != 0)
+          continue;
+        TudfSurfaceEstimate surface;
+        if (fillCachedTudfSurfaceCell(
+              container,
+              cache,
+              block_to_compact,
+              tudfCellPosition(entry, voxel_idx),
+              source_state,
+              require_opposing_support,
+              surface))
+          cached = cacheTudfSurface(surface, source_state + 1);
+      }
+    }
+
+    __device__ int3 tudfConnectorOffset(const TudfSurfaceEstimate surface, const int index) {
+      if (index < 3)
+        return basisVector(index);
+      const int2 tangent_offsets[42] = {
+        make_int2(0, 2),
+        make_int2(1, -2),
+        make_int2(1, -1),
+        make_int2(1, 1),
+        make_int2(1, 2),
+        make_int2(2, -2),
+        make_int2(2, -1),
+        make_int2(2, 0),
+        make_int2(2, 1),
+        make_int2(2, 2),
+        make_int2(0, 3),
+        make_int2(1, -3),
+        make_int2(1, 3),
+        make_int2(2, -3),
+        make_int2(2, 3),
+        make_int2(3, -3),
+        make_int2(3, -2),
+        make_int2(3, -1),
+        make_int2(3, 0),
+        make_int2(3, 1),
+        make_int2(3, 2),
+        make_int2(3, 3),
+        make_int2(0, 4),
+        make_int2(1, -4),
+        make_int2(1, 4),
+        make_int2(2, -4),
+        make_int2(2, 4),
+        make_int2(3, -4),
+        make_int2(3, 4),
+        make_int2(4, -4),
+        make_int2(4, -3),
+        make_int2(4, -2),
+        make_int2(4, -1),
+        make_int2(4, 0),
+        make_int2(4, 1),
+        make_int2(4, 2),
+        make_int2(4, 3),
+        make_int2(4, 4),
+        make_int2(0, 5),
+        make_int2(5, 0),
+        make_int2(5, -5),
+        make_int2(5, 5),
+      };
+      const int normal_axis = dominantAxis(surface.normal);
+      const int first_axis = (normal_axis + 1) % 3;
+      const int second_axis = (normal_axis + 2) % 3;
+      const int2 offset = tangent_offsets[index - 3];
+      return offset.x * basisVector(first_axis) + offset.y * basisVector(second_axis);
+    }
+
+    template <typename T>
+    __device__ int cachedTudfConnectorCount(const VoxelContainer<T>* container,
+                                            const TudfSurfaceCache* cache,
+                                            const uint* block_to_compact,
+                                            const int3 cell_position,
+                                            const TudfSurfaceEstimate surface) {
+      int connector_count = 0;
+      for (int neighbor_index = 0; neighbor_index < 45; ++neighbor_index) {
+        TudfSurfaceEstimate neighbor;
+        if (!getCachedTudfSurface(
+              container,
+              cache,
+              block_to_compact,
+              cell_position + tudfConnectorOffset(surface, neighbor_index),
+              3,
+              neighbor) ||
+            fabsf(dot(surface.normal, neighbor.normal)) < tudf_min_connector_normal_alignment)
+          continue;
+        const int3 span = abs(neighbor.position - surface.position);
+        if (maxComponent(span) <= tudf_max_connector_coordinate_span)
+          connector_count += max(0, dot(span, make_int3(1)) - 1);
+      }
+      return connector_count;
+    }
+
+    __device__ float packedNormalColor(const float3 normal) {
+      const float3 color = clamp(0.5f * normal + 0.5f, 0.f, 1.f) * 255.f;
+      const uint packed = __float2uint_rn(color.x) |
+                          (__float2uint_rn(color.y) << 8) |
+                          (__float2uint_rn(color.z) << 16);
+      return __uint_as_float(packed);
+    }
+
+    template <typename T>
+    __device__ void writeTwoSidedSurfaceVoxel(const VoxelContainer<T>* container,
+                                              const int3 position,
+                                              const float density,
+                                              const float3 normal,
+                                              const uint output_idx,
+                                              float* voxels) {
+      const float3 point = virtualVoxelPosToWorld(container->virtual_voxel_size_, position);
+      voxels[output_idx * 5 + 0] = point.x;
+      voxels[output_idx * 5 + 1] = point.y;
+      voxels[output_idx * 5 + 2] = point.z;
+      voxels[output_idx * 5 + 3] = density;
+      voxels[output_idx * 5 + 4] = packedNormalColor(normal);
+    }
+
+    __device__ float median(float* values, const int count) {
+      for (int index = 1; index < count; ++index) {
+        const float value = values[index];
+        int insertion = index;
+        while (insertion > 0 && values[insertion - 1] > value) {
+          values[insertion] = values[insertion - 1];
+          --insertion;
+        }
+        values[insertion] = value;
+      }
+      const int middle = count / 2;
+      return count % 2 == 0 ? 0.5f * (values[middle - 1] + values[middle]) : values[middle];
+    }
+
+    template <typename T>
+    __global__ void completeTudfFieldKernel(VoxelContainer<T>* container) {
+      const HashEntry& entry = container->d_compactHashTable_[blockIdx.x];
+      const int scale = 1 << entry.resolution;
+      for (uint voxel_idx = threadIdx.x; voxel_idx < container->getNumVoxels(entry); voxel_idx += blockDim.x) {
+        T& voxel = container->d_SDFBlocks_[entry.ptr + voxel_idx];
+        if (twoSidedSurfaceWeight(voxel) >= container->min_weight_threshold_)
+          continue;
+
+        const int3 position = SDFBlockToVirtualVoxelPos(entry.pos) +
+                              scale * make_int3(delinearizeVoxelPos(voxel_idx, sdf_block_size / scale));
+        float distances[6];
+        int distance_count = 0;
+        int neighbor_count = 0;
+        for (int axis = 0; axis < 3; ++axis) {
+          const int3 direction = scale * basisVector(axis);
+          for (int side = -1; side <= 1; side += 2) {
+            const T neighbor = container->getVoxel(position + side * direction);
+            if (twoSidedSurfaceWeight(neighbor) >= container->min_weight_threshold_) {
+              distances[distance_count++] = twoSidedSurfaceDistance(neighbor);
+              ++neighbor_count;
+            }
+          }
+        }
+        if (neighbor_count < tudf_min_completion_neighbors)
+          continue;
+        const bool measured = twoSidedSurfaceWeight(voxel) > 0;
+        voxel.sdf = measured
+                      ? twoSidedSurfaceDistance(voxel)
+                      : median(distances, distance_count);
+        voxel.weight = container->min_weight_threshold_;
+        voxel.sum_squared = static_cast<int>(
+          measured ? TudfSampleSupport::promoted : TudfSampleSupport::completed);
+      }
+    }
+
+    template <typename T>
+    __global__ void selectOwnerBlocksKernel(const VoxelContainer<T>* container,
+                                            const int3 owner_chunk,
+                                            const float3 chunk_extents,
+                                            uint* owner_blocks,
+                                            uint* owner_block_count) {
+      const uint block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+      if (block_idx >= container->current_occupied_blocks_)
+        return;
+      const HashEntry& entry = container->d_compactHashTable_[block_idx];
+      const float3 block_position = SDFBlockToWorldPoint(container->virtual_voxel_size_, entry.pos);
+      const int3 block_chunk = worldToChunks(block_position, chunk_extents);
+      if (block_chunk.x == owner_chunk.x && block_chunk.y == owner_chunk.y && block_chunk.z == owner_chunk.z)
+        owner_blocks[atomicAdd(owner_block_count, 1)] = block_idx;
+    }
+
+    template <typename T>
+    __launch_bounds__(tudf_extraction_threads) __global__ void tudfSurfaceVoxelCountsKernel(
+      const VoxelContainer<T>* container,
+      const TudfSurfaceCache* cache,
+      const uint* block_to_compact,
+      const uint* owner_blocks,
+      uint* counts) {
+      const uint owner_block_idx = blockIdx.x;
+      const uint block_idx = owner_blocks[owner_block_idx];
+
+      __shared__ uint count;
+      if (threadIdx.x == 0)
+        count = 0;
+      __syncthreads();
+
+      const HashEntry& entry = container->d_compactHashTable_[block_idx];
+      for (uint voxel_idx = threadIdx.x; voxel_idx < container->getNumVoxels(entry); voxel_idx += blockDim.x) {
+        const TudfSurfaceCache cached = cache[block_idx * total_sdf_block_size + voxel_idx];
+        if (cached.state == 0)
+          continue;
+        const int3 cell_position = tudfCellPosition(entry, voxel_idx);
+        const TudfSurfaceEstimate surface = unpackTudfSurface(cached, cell_position);
+        atomicAdd(
+          &count,
+          1 + cachedTudfConnectorCount(
+                container, cache, block_to_compact, cell_position, surface));
+      }
+
+      __syncthreads();
+      if (threadIdx.x == 0)
+        counts[owner_block_idx] = count;
+    }
+
+    template <typename T>
+    __launch_bounds__(tudf_extraction_threads) __global__ void tudfSurfaceVoxelFillKernel(
+      const VoxelContainer<T>* container,
+      const TudfSurfaceCache* cache,
+      const uint* block_to_compact,
+      const uint* offsets,
+      const uint* owner_blocks,
+      const uint start_owner_block,
+      float* voxels) {
+      const uint owner_block_idx = start_owner_block + blockIdx.x;
+      const uint block_idx = owner_blocks[owner_block_idx];
+
+      __shared__ uint local_count;
+      if (threadIdx.x == 0)
+        local_count = 0;
+      __syncthreads();
+
+      const HashEntry& entry = container->d_compactHashTable_[block_idx];
+      for (uint voxel_idx = threadIdx.x; voxel_idx < container->getNumVoxels(entry); voxel_idx += blockDim.x) {
+        const TudfSurfaceCache cached = cache[block_idx * total_sdf_block_size + voxel_idx];
+        if (cached.state == 0)
+          continue;
+        const int3 cell_position = tudfCellPosition(entry, voxel_idx);
+        const TudfSurfaceEstimate surface = unpackTudfSurface(cached, cell_position);
+        const int connector_count = cachedTudfConnectorCount(
+          container, cache, block_to_compact, cell_position, surface);
+        uint output_idx = offsets[owner_block_idx] - offsets[start_owner_block] +
+                          atomicAdd(&local_count, 1 + connector_count);
+        writeTwoSidedSurfaceVoxel(
+          container, surface.position, surface.density, surface.normal, output_idx, voxels);
+        ++output_idx;
+
+        for (int neighbor_index = 0; neighbor_index < 45; ++neighbor_index) {
+          TudfSurfaceEstimate neighbor;
+          if (!getCachedTudfSurface(
+                container,
+                cache,
+                block_to_compact,
+                cell_position + tudfConnectorOffset(surface, neighbor_index),
+                3,
+                neighbor) ||
+              fabsf(dot(surface.normal, neighbor.normal)) < tudf_min_connector_normal_alignment)
+            continue;
+          const int3 span = abs(neighbor.position - surface.position);
+          if (maxComponent(span) > tudf_max_connector_coordinate_span)
+            continue;
+          const int manhattan_distance = dot(span, make_int3(1));
+          const float orientation = copysignf(1.f, dot(surface.normal, neighbor.normal));
+          const float3 connector_normal = normalize(surface.normal + orientation * neighbor.normal);
+          const float connector_density = 0.5f * (surface.density + neighbor.density);
+          int3 connector_position = surface.position;
+          int connector_index = 0;
+          for (int axis = 0; axis < 3; ++axis) {
+            const int coordinate = component(neighbor.position, axis);
+            const int current_coordinate = component(connector_position, axis);
+            const int step = coordinate >= current_coordinate ? 1 : -1;
+            while (component(connector_position, axis) != coordinate) {
+              connector_position += step * basisVector(axis);
+              if (++connector_index < manhattan_distance)
+                writeTwoSidedSurfaceVoxel(
+                  container, connector_position, connector_density, connector_normal, output_idx++, voxels);
+            }
+          }
+        }
+      }
+    }
+
+    template <typename T>
+    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+    VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::tudfSurfaceVoxels(
+      const int3& owner_chunk, const float3& chunk_extents) {
+      flatAndReduceHashTable();
+      if (current_occupied_blocks_ == 0)
+        return Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(0, 5);
+
+      for (int completion_pass = 0; completion_pass < 3; ++completion_pass)
+        completeTudfFieldKernel<<<current_occupied_blocks_, tudf_extraction_threads>>>(d_instance_);
+      TudfSurfaceCache* d_surface_cache = nullptr;
+      uint* d_block_to_compact = nullptr;
+      CUDA_CHECK(cudaMalloc(
+        (void**) &d_surface_cache,
+        sizeof(TudfSurfaceCache) * current_occupied_blocks_ * total_sdf_block_size));
+      CUDA_CHECK(cudaMalloc((void**) &d_block_to_compact, sizeof(uint) * num_sdf_blocks_));
+      CUDA_CHECK(cudaMemset(d_block_to_compact, 0xff, sizeof(uint) * num_sdf_blocks_));
+      initializeTudfSurfaceCacheKernel<<<current_occupied_blocks_, tudf_extraction_threads>>>(
+        d_instance_, d_surface_cache, d_block_to_compact);
+      markNonminimalTudfSurfacesKernel<<<current_occupied_blocks_, tudf_extraction_threads>>>(
+        d_instance_, d_surface_cache, d_block_to_compact);
+      removeMarkedTudfSurfacesKernel<<<current_occupied_blocks_, tudf_extraction_threads>>>(
+        d_surface_cache);
+      smoothUnderobservedTudfSurfacesKernel<<<current_occupied_blocks_, tudf_extraction_threads>>>(
+        d_instance_, d_surface_cache, d_block_to_compact);
+      fillTudfSurfaceCacheKernel<<<current_occupied_blocks_, tudf_extraction_threads>>>(
+        d_instance_, d_surface_cache, d_block_to_compact, 1, false);
+      fillTudfSurfaceCacheKernel<<<current_occupied_blocks_, tudf_extraction_threads>>>(
+        d_instance_, d_surface_cache, d_block_to_compact, 2, true);
+      fillTudfSurfaceCacheKernel<<<current_occupied_blocks_, tudf_extraction_threads>>>(
+        d_instance_, d_surface_cache, d_block_to_compact, 3, true);
+      fillTudfSurfaceCacheKernel<<<current_occupied_blocks_, tudf_extraction_threads>>>(
+        d_instance_, d_surface_cache, d_block_to_compact, 4, true);
+      fillTudfSurfaceCacheKernel<<<current_occupied_blocks_, tudf_extraction_threads>>>(
+        d_instance_, d_surface_cache, d_block_to_compact, 5, true);
+      uint* d_owner_blocks = nullptr;
+      uint* d_owner_block_count = nullptr;
+      CUDA_CHECK(cudaMalloc((void**) &d_owner_blocks, sizeof(uint) * current_occupied_blocks_));
+      CUDA_CHECK(cudaMalloc((void**) &d_owner_block_count, sizeof(uint)));
+      CUDA_CHECK(cudaMemset(d_owner_block_count, 0, sizeof(uint)));
+      constexpr uint selection_threads = 256;
+      const uint selection_blocks = (current_occupied_blocks_ + selection_threads - 1) / selection_threads;
+      selectOwnerBlocksKernel<<<selection_blocks, selection_threads>>>(
+        d_instance_, owner_chunk, chunk_extents, d_owner_blocks, d_owner_block_count);
+      uint owner_block_count = 0;
+      CUDA_CHECK(cudaMemcpy(&owner_block_count, d_owner_block_count, sizeof(uint), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaFree(d_owner_block_count));
+      if (owner_block_count == 0) {
+        CUDA_CHECK(cudaFree(d_owner_blocks));
+        CUDA_CHECK(cudaFree(d_block_to_compact));
+        CUDA_CHECK(cudaFree(d_surface_cache));
+        return Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(0, 5);
+      }
+
+      uint* d_counts = nullptr;
+      uint* d_offsets = nullptr;
+      CUDA_CHECK(cudaMalloc((void**) &d_counts, sizeof(uint) * owner_block_count));
+      CUDA_CHECK(cudaMalloc((void**) &d_offsets, sizeof(uint) * (owner_block_count + 1)));
+      CUDA_CHECK(cudaMemset(d_offsets, 0, sizeof(uint)));
+
+      tudfSurfaceVoxelCountsKernel<<<owner_block_count, tudf_extraction_threads>>>(
+        d_instance_, d_surface_cache, d_block_to_compact, d_owner_blocks, d_counts);
+      CUDA_CHECK(cudaDeviceSynchronize());
+
+      thrust::device_ptr<uint> counts_ptr(d_counts);
+      thrust::device_ptr<uint> offsets_ptr(d_offsets);
+      thrust::inclusive_scan(thrust::device, counts_ptr, counts_ptr + owner_block_count, offsets_ptr + 1);
+
+      uint surface_count = 0;
+      CUDA_CHECK(cudaMemcpy(&surface_count, d_offsets + owner_block_count, sizeof(uint), cudaMemcpyDeviceToHost));
+      Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> surface_voxels(surface_count, 5);
+      std::vector<uint> offsets(owner_block_count + 1);
+      CUDA_CHECK(cudaMemcpy(
+        offsets.data(), d_offsets, sizeof(uint) * offsets.size(), cudaMemcpyDeviceToHost));
+      size_t free_bytes = 0;
+      size_t total_bytes = 0;
+      CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+      const uint batch_sample_capacity = free_bytes / (2 * sizeof(float) * 5);
+      for (uint start_owner_block = 0; start_owner_block < owner_block_count;) {
+        uint end_owner_block = start_owner_block + 1;
+        while (end_owner_block < owner_block_count &&
+               offsets[end_owner_block + 1] - offsets[start_owner_block] <= batch_sample_capacity)
+          ++end_owner_block;
+        const uint batch_count = offsets[end_owner_block] - offsets[start_owner_block];
+        float* d_voxels = nullptr;
+        CUDA_CHECK(cudaMalloc((void**) &d_voxels, sizeof(float) * batch_count * 5));
+        tudfSurfaceVoxelFillKernel<<<end_owner_block - start_owner_block, tudf_extraction_threads>>>(
+          d_instance_,
+          d_surface_cache,
+          d_block_to_compact,
+          d_offsets,
+          d_owner_blocks,
+          start_owner_block,
+          d_voxels);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(
+          surface_voxels.data() + offsets[start_owner_block] * 5,
+          d_voxels,
+          sizeof(float) * batch_count * 5,
+          cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(d_voxels));
+        start_owner_block = end_owner_block;
+      }
+
+      CUDA_CHECK(cudaFree(d_counts));
+      CUDA_CHECK(cudaFree(d_offsets));
+      CUDA_CHECK(cudaFree(d_owner_blocks));
+      CUDA_CHECK(cudaFree(d_block_to_compact));
+      CUDA_CHECK(cudaFree(d_surface_cache));
       return surface_voxels;
     }
 
@@ -854,7 +1811,7 @@ namespace cupanutils {
     }
 
     template <typename T>
-    __global__ void allocBlocksKernel(const CUDAMatrixf3* point_cloud_img,
+    __global__ void allocBlocksKernel(const CUDAMatrixf* depth_img,
                                       const Camera* camera,
                                       const float max_integration_distance,
                                       const float sdf_truncation,
@@ -863,13 +1820,13 @@ namespace cupanutils {
       int row = blockDim.y * blockIdx.y + threadIdx.y;
       int col = blockDim.x * blockIdx.x + threadIdx.x;
 
-      if (!point_cloud_img->inside(row, col))
+      if (!depth_img->inside(row, col))
         return;
 
-      const float& depth = camera->getDepth(point_cloud_img->at<1>(row, col));
+      const float depth = depth_img->at<1>(row, col);
 
-      if (depth == 0.f)
-        return; // set to 0 during pc initialization, if empty
+      if (depth <= camera->minDepth() || depth > camera->maxDepth())
+        return;
 
       const float t         = getTruncation(depth, sdf_truncation, sdf_truncation_scale);
       const float min_depth = min(max_integration_distance, depth - t);
@@ -970,7 +1927,7 @@ namespace cupanutils {
     }
 
     template <typename T>
-    void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::allocBlocks(const CUDAMatrixf3& point_cloud_img,
+    void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::allocBlocks(const CUDAMatrixf& depth_img,
                                                                                       const Camera& camera) {
       // fast version, does not guarantee that all blocks are allocated (staggers alloc to the next frame)
 
@@ -979,8 +1936,6 @@ namespace cupanutils {
 
       resetHashBucketMutex();
 
-      int counter_low;
-      CUDA_CHECK(cudaMemcpy(&counter_low, d_heapCounterLow_, sizeof(int), cudaMemcpyDeviceToHost));
       if (sdf_var_threshold_ > 0.f && getHeapLowFreeCount() < low_blocks_to_allocate_) {
         std::cerr << "allocBlocks | need to allocate additional memory in low-res heap" << std::endl;
         const dim3 threads_per_block_lowalloc(octree_branching_factor, 1);
@@ -989,7 +1944,7 @@ namespace cupanutils {
         CUDA_CHECK(cudaDeviceSynchronize());
       }
 
-      allocBlocksKernel<<<camera.blocks(), camera.threads()>>>(point_cloud_img.deviceInstance(),
+      allocBlocksKernel<<<camera.blocks(), camera.threads()>>>(depth_img.deviceInstance(),
                                                                camera.deviceInstance(),
                                                                max_integration_distance_,
                                                                sdf_truncation_,
@@ -1001,7 +1956,7 @@ namespace cupanutils {
 
       while (1) {
         resetHashBucketMutex();
-        allocBlocksKernel<<<camera.blocks(), camera.threads()>>>(point_cloud_img.deviceInstance(),
+        allocBlocksKernel<<<camera.blocks(), camera.threads()>>>(depth_img.deviceInstance(),
                                                                  camera.deviceInstance(),
                                                                  max_integration_distance_,
                                                                  sdf_truncation_,
@@ -1143,9 +2098,6 @@ namespace cupanutils {
 
       resetHashBucketMutex();
 
-      int counter_low;
-      CUDA_CHECK(cudaMemcpy(&counter_low, d_heapCounterLow_, sizeof(int), cudaMemcpyDeviceToHost));
-
       if (sdf_var_threshold_ > 0.f && getHeapLowFreeCount() < low_blocks_to_allocate_) {
         std::cerr << "allocBlocks | need to allocate additional memory in low-res heap" << std::endl;
         const dim3 threads_per_block_lowalloc(octree_branching_factor, 1);
@@ -1191,7 +2143,7 @@ namespace cupanutils {
     }
 
     template <typename T>
-    __global__ void integrateDepthMapKernel(const CUDAMatrixf3* point_cloud_img,
+    __global__ void integrateDepthMapKernel(const CUDAMatrixf* depth_img,
                                             const CUDAMatrixuc3* rgb_img,
                                             const Camera* camera,
                                             const float sdf_truncation,
@@ -1230,8 +2182,8 @@ namespace cupanutils {
       const auto& col = img_point.y;
 
       // if depth is good
-      const float depth = camera->getDepth(point_cloud_img->at<1>(row, col));
-      if (depth == 0.f || depth > max_integration_distance) // from matrix initialization, emtpy is 0
+      const float depth = depth_img->at<1>(row, col);
+      if (depth <= camera->minDepth() || depth > max_integration_distance)
         return;
 
       const float depth_normalized = camera->normalizeDepth(depth);
@@ -1239,26 +2191,40 @@ namespace cupanutils {
       float sdf              = depth - camera->getDepth(pcam);
       const float truncation = getTruncation(depth, sdf_truncation, sdf_truncation_scale);
 
-      if (sdf <= -truncation)
-        return;
-
-      // truncate signed distance
-      if (sdf >= 0.f)
+      if (container->two_sided_surface_field_) {
+        if (fabsf(sdf) > truncation)
+          return;
+        sdf = fabsf(sdf);
+      } else {
+        if (sdf <= -truncation)
+          return;
         sdf = fminf(truncation, sdf);
-      else
-        sdf = fmaxf(-truncation, sdf);
+      }
 
       // float weight_update = fmaxf(integration_weight_sample * 1.5f * (1.f - depth_normalized), 1);
       float weight_update = integration_weight_sample;
 
       // construct current voxel
       T curr;
-      curr.sdf    = sdf;
-      curr.weight = weight_update;
-      curr.rgb    = rgb_img->at<1>(row, col);
+      if (container->two_sided_surface_field_) {
+        curr.sdf = sdf;
+        curr.sum_squared = sdf * sdf;
+        curr.weight = weight_update;
+      } else {
+        curr.sdf = sdf;
+        curr.weight = weight_update;
+        curr.rgb = rgb_img->at<1>(row, col);
+      }
 
       // integrate
-      uint volume_idx   = entry.ptr + voxel_idx;
+      const uint volume_idx = entry.ptr + voxel_idx;
+      if (container->two_sided_surface_field_) {
+        T merged_voxel;
+        combineTwoSidedSurfaceVoxel(
+          container->d_SDFBlocks_[volume_idx], curr, integration_weight_max, merged_voxel);
+        container->d_SDFBlocks_[volume_idx] = merged_voxel;
+        return;
+      }
       float curr_mean   = 0.f;
       float curr_sum_sq = 0.f;
       if (container->d_SDFBlocks_[volume_idx].weight > 0) {
@@ -1289,7 +2255,7 @@ namespace cupanutils {
     }
 
     template <typename T>
-    void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrateDepthMap(const CUDAMatrixf3& point_cloud_img,
+    void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrateDepthMap(const CUDAMatrixf& depth_img,
                                                                                             const CUDAMatrixuc3& rgb_img,
                                                                                             const Camera& camera) {
       const dim3 threads_per_block(n_threads, n_threads, 1);
@@ -1297,7 +2263,7 @@ namespace cupanutils {
                           (voxel_block_volume_ + threads_per_block.y - 1) / threads_per_block.y,
                           1);
       if (current_occupied_blocks_ > 0) {
-        integrateDepthMapKernel<<<n_blocks, threads_per_block>>>(point_cloud_img.deviceInstance(),
+        integrateDepthMapKernel<<<n_blocks, threads_per_block>>>(depth_img.deviceInstance(),
                                                                  rgb_img.deviceInstance(),
                                                                  camera.deviceInstance(),
                                                                  sdf_truncation_,
@@ -2038,7 +3004,7 @@ namespace cupanutils {
     }
 
     template <typename T>
-    __global__ void reintegrateDepthMapKernel(const CUDAMatrixf3* point_cloud_img,
+    __global__ void reintegrateDepthMapKernel(const CUDAMatrixf* depth_img,
                                               const CUDAMatrixuc3* rgb_img,
                                               const Camera* camera,
                                               const float sdf_truncation,
@@ -2078,8 +3044,8 @@ namespace cupanutils {
       const auto& col = img_point.y;
 
       // if depth is good
-      const float depth = camera->getDepth(point_cloud_img->at<1>(row, col));
-      if (depth == 0.f || depth > max_integration_distance) // from matrix initialization, emtpy is 0
+      const float depth = depth_img->at<1>(row, col);
+      if (depth <= camera->minDepth() || depth > max_integration_distance)
         return;
 
       const float depth_normalized = camera->normalizeDepth(depth);
@@ -2087,32 +3053,43 @@ namespace cupanutils {
       float sdf              = depth - camera->getDepth(pcam);
       const float truncation = getTruncation(depth, sdf_truncation, sdf_truncation_scale);
 
-      if (sdf <= -truncation)
-        return;
-
-      // truncate signed distance
-      if (sdf >= 0.f)
+      if (container->two_sided_surface_field_) {
+        if (fabsf(sdf) > truncation)
+          return;
+        sdf = fabsf(sdf);
+      } else {
+        if (sdf <= -truncation)
+          return;
         sdf = fminf(truncation, sdf);
-      else
-        sdf = fmaxf(-truncation, sdf);
+      }
 
       // float weight_update = fmaxf(integration_weight_sample * 1.5f * (1.f - depth_normalized), 1);
       float weight_update = integration_weight_sample;
 
       // construct current voxel
       T curr;
-      curr.sdf    = sdf;
-      curr.weight = weight_update;
-      curr.rgb    = rgb_img->at<1>(row, col);
+      if (container->two_sided_surface_field_) {
+        curr.sdf = sdf;
+        curr.sum_squared = sdf * sdf;
+        curr.weight = weight_update;
+      } else {
+        curr.sdf = sdf;
+        curr.weight = weight_update;
+        curr.rgb = rgb_img->at<1>(row, col);
+      }
 
       // integrate
       uint volume_idx = entry.ptr + voxel_idx;
 
       T merged_voxel;
-      if (container->d_SDFBlocks_[volume_idx].weight == 0) {
-        container->d_SDFBlocks_[volume_idx].rgb = curr.rgb;
+      if (container->two_sided_surface_field_)
+        combineTwoSidedSurfaceVoxel(
+          container->d_SDFBlocks_[volume_idx], curr, integration_weight_max, merged_voxel);
+      else {
+        if (container->d_SDFBlocks_[volume_idx].weight == 0)
+          container->d_SDFBlocks_[volume_idx].rgb = curr.rgb;
+        combineVoxel<T>(container->d_SDFBlocks_[volume_idx], curr, integration_weight_max, merged_voxel);
       }
-      combineVoxel<T>(container->d_SDFBlocks_[volume_idx], curr, integration_weight_max, merged_voxel);
       container->d_SDFBlocks_[volume_idx] = merged_voxel;
     }
 
@@ -2183,7 +3160,7 @@ namespace cupanutils {
     }
 
     template <typename T>
-    void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::reintegrateDepthMap(const CUDAMatrixf3& point_cloud_img,
+    void VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::reintegrateDepthMap(const CUDAMatrixf& depth_img,
                                                                                               const CUDAMatrixuc3& rgb_img,
                                                                                               const Camera& camera) {
       uint num_reintegrate = 0;
@@ -2193,7 +3170,7 @@ namespace cupanutils {
         const dim3 n_blocks((num_reintegrate + threads_per_block.x - 1) / threads_per_block.x,
                             (voxel_block_volume_ + threads_per_block.y - 1) / threads_per_block.y,
                             1);
-        reintegrateDepthMapKernel<<<n_blocks, n_threads>>>(point_cloud_img.deviceInstance(),
+        reintegrateDepthMapKernel<<<n_blocks, n_threads>>>(depth_img.deviceInstance(),
                                                            rgb_img.deviceInstance(),
                                                            camera.deviceInstance(),
                                                            sdf_truncation_,
@@ -2223,54 +3200,20 @@ namespace cupanutils {
       }
 
 #ifdef RESOLVE_COLLISION
-      // updated variables as after the loop
       const uint idx_last_entry_in_bucket = (h + 1) * hash_bucket_size_ - 1; // get last index of bucket
-
-      uint i = idx_last_entry_in_bucket; // start with the last entry of the current bucket
-      HashEntry curr;
-
-      unsigned int max_iter    = 0;
-      uint max_loop_iter_count = linked_list_size_;
-#pragma unroll 1
-      while (max_iter <
-             max_loop_iter_count) { // traverse list until end // why find the end? we you are inserting at the start !!!
-        curr = d_hashTable_[i];
-        if (curr.offset == 0)
-          break;                                      // we have found the end of the list
-        i = idx_last_entry_in_bucket + curr.offset;   // go to next element in the list
-        i %= (hash_bucket_size_ * hash_num_buckets_); // check for overflow
-
-        max_iter++;
-      }
-
-      max_iter   = 0;
       int offset = 0;
 #pragma unroll 1
-      while (max_iter < max_loop_iter_count) { // linear search for free entry
+      for (uint attempt = 0; attempt < linked_list_size_; ++attempt) {
         offset++;
-        uint i = (idx_last_entry_in_bucket + offset) % (hash_bucket_size_ * hash_num_buckets_); // go to next hash element
+        const uint i = (idx_last_entry_in_bucket + offset) % total_size_;
         if ((offset % hash_bucket_size_) == 0)
-          continue; // cannot insert into a last bucket element (would conflict with other linked lists)
+          continue;
 
-        int prev_weight = 0;
-        uint* d_hash_ui = (uint*) d_hashTable_;
-        prev_weight = prev_weight = atomicCAS(&d_hash_ui[3 * idx_last_entry_in_bucket + 1], (uint) FREE_ENTRY, (uint) LOCK_ENTRY);
-        if (prev_weight == FREE_ENTRY) { // if free entry found set prev->next = curr & curr->next = prev->next
-
-          HashEntry last_entry_in_bucket = d_hashTable_[idx_last_entry_in_bucket]; // get prev (= lastEntry in Bucket)
-
-          int new_offset_prev =
-            (offset << 16) | (last_entry_in_bucket.pos.z & 0x0000ffff); // prev->next = curr (maintain old z-pos)
-          int old_offset_prev = 0;
-          uint* d_hash_ui     = (uint*) d_hashTable_;
-          old_offset_prev = prev_weight = atomicExch(&d_hash_ui[3 * idx_last_entry_in_bucket + 1], new_offset_prev);
-          entry.offset                  = old_offset_prev >> 16; // remove prev z-pos from old offset
-
+        if (atomicCAS(&d_hashTable_[i].ptr, FREE_ENTRY, LOCK_ENTRY) == FREE_ENTRY) {
+          entry.offset = atomicExch(&d_hashTable_[idx_last_entry_in_bucket].offset, offset);
           d_hashTable_[i] = entry;
           return true;
         }
-
-        max_iter++;
       }
 #endif
 

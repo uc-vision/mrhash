@@ -165,6 +165,9 @@ __forceinline__ __host__ __device__ uint3 make_uint3(uint4 a) {
 __forceinline__ __host__ __device__ uint3 make_uint3(int3 a) {
   return make_uint3(uint(a.x), uint(a.y), uint(a.z));
 }
+__forceinline__ __host__ __device__ uint3 make_uint3(float3 a) {
+  return make_uint3(uint(a.x), uint(a.y), uint(a.z));
+}
 
 __forceinline__ __host__ __device__ float4 make_float4(float s) {
   return make_float4(s, s, s, s);
@@ -873,6 +876,12 @@ __forceinline__ __host__ __device__ int2 min(int2 a, int2 b) {
 __forceinline__ __host__ __device__ int3 min(int3 a, int3 b) {
   return make_int3(min(a.x, b.x), min(a.y, b.y), min(a.z, b.z));
 }
+__forceinline__ __host__ __device__ int minComponent(int3 value) {
+  return min(value.x, min(value.y, value.z));
+}
+__forceinline__ __host__ __device__ float minComponent(float3 value) {
+  return fminf(value.x, fminf(value.y, value.z));
+}
 __forceinline__ __host__ __device__ int4 min(int4 a, int4 b) {
   return make_int4(min(a.x, b.x), min(a.y, b.y), min(a.z, b.z), min(a.w, b.w));
 }
@@ -906,6 +915,12 @@ __forceinline__ __host__ __device__ int2 max(int2 a, int2 b) {
 }
 __forceinline__ __host__ __device__ int3 max(int3 a, int3 b) {
   return make_int3(max(a.x, b.x), max(a.y, b.y), max(a.z, b.z));
+}
+__forceinline__ __host__ __device__ int maxComponent(int3 value) {
+  return max(value.x, max(value.y, value.z));
+}
+__forceinline__ __host__ __device__ float maxComponent(float3 value) {
+  return fmaxf(value.x, fmaxf(value.y, value.z));
 }
 __forceinline__ __host__ __device__ int4 max(int4 a, int4 b) {
   return make_int4(max(a.x, b.x), max(a.y, b.y), max(a.z, b.z), max(a.w, b.w));
@@ -1043,6 +1058,30 @@ __forceinline__ __host__ __device__ uint dot(uint3 a, uint3 b) {
 }
 __forceinline__ __host__ __device__ uint dot(uint4 a, uint4 b) {
   return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
+__forceinline__ __host__ __device__ int3 basisVector(const int axis) {
+  return make_int3(axis == 0, axis == 1, axis == 2);
+}
+
+__forceinline__ __host__ __device__ int component(const int3 vector, const int axis) {
+  return dot(vector, basisVector(axis));
+}
+
+__forceinline__ __host__ __device__ float component(const float3 vector, const int axis) {
+  return dot(vector, make_float3(basisVector(axis)));
+}
+
+__forceinline__ __host__ __device__ int3 withComponent(
+  const int3 vector, const int axis, const int value) {
+  const int3 basis = basisVector(axis);
+  return vector + (value - dot(vector, basis)) * basis;
+}
+
+__forceinline__ __host__ __device__ float3 withComponent(
+  const float3 vector, const int axis, const float value) {
+  const float3 basis = make_float3(basisVector(axis));
+  return vector + (value - dot(vector, basis)) * basis;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

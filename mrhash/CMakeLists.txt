@@ -203,6 +203,9 @@ else()
 endif()
 
 set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
+foreach(MRHASH_CUDA_ARCH IN LISTS CUDA_ARCH_LIST)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_${MRHASH_CUDA_ARCH},code=sm_${MRHASH_CUDA_ARCH}>)
+endforeach()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
 
 find_package(Python 3.8 COMPONENTS Interpreter Development REQUIRED)
