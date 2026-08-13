@@ -12,6 +12,46 @@ namespace cupanutils {
     ///////////////////////////////////////////////////////////////////////////
 
     template <typename T>
+    __device__ void streamOutHashEntry(const uint bucket_id,
+                                       uint* output_counter,
+                                       SDFBlockDesc* output,
+                                       VoxelContainer<T>* container) {
+      HashEntry& entry = container->d_hashTable_[bucket_id];
+      const SDFBlockDesc description(entry);
+#ifndef RESOLVE_COLLISION
+      const uint address = atomicAdd(output_counter, 1);
+      output[address] = description;
+      if (entry.resolution == 0)
+        container->appendHeapHigh(entry.ptr / container->getNumVoxels(entry));
+      else if (entry.resolution == 1)
+        container->appendHeapLow(entry.ptr / container->getNumVoxels(entry));
+      deleteHashEntry(bucket_id);
+#endif
+#ifdef RESOLVE_COLLISION
+      const uint entry_hash = container->directional_tsdf_
+                                ? container->calculateHash(entry.pos, static_cast<TSDFDirection>(entry.direction))
+                                : container->calculateHash(entry.pos);
+      if (entry.offset != 0 || entry_hash != bucket_id / container->hash_bucket_size_) {
+        const bool deleted = container->directional_tsdf_
+                               ? container->deleteHashEntryElement(entry.pos, static_cast<TSDFDirection>(entry.direction))
+                               : container->deleteHashEntryElement(entry.pos);
+        if (deleted) {
+          const uint address = atomicAdd(output_counter, 1);
+          output[address] = description;
+        }
+      } else {
+        const uint address = atomicAdd(output_counter, 1);
+        output[address] = description;
+        if (entry.resolution == 0)
+          container->appendHeapHigh(entry.ptr / container->getNumVoxels(entry));
+        else if (entry.resolution == 1)
+          container->appendHeapLow(entry.ptr / container->getNumVoxels(entry));
+        deleteHashEntry(entry);
+      }
+#endif
+    }
+
+    template <typename T>
     __global__ void integrateFromGlobalHashPass1Kernel(const float radius,
                                                        const float3 camera_position,
                                                        const int start_idx,
@@ -28,36 +68,40 @@ namespace cupanutils {
       float3 pw = SDFBlockToWorldPoint(container->virtual_voxel_size_, entry.pos);
       float d   = length(pw, camera_position);
 
-      if (entry.ptr != FREE_ENTRY && d >= radius) {
-        SDFBlockDesc desc(entry);
+      if (entry.ptr != FREE_ENTRY && d >= radius)
+        streamOutHashEntry(bucket_id, d_outputCounter, d_output, container);
+    }
 
-#ifndef RESOLVE_COLLISION
-        uint addr      = atomicAdd(&d_outputCounter[0], 1);
-        d_output[addr] = desc;
+    template <typename T>
+    __global__ void integrateOutsideCameraFrustumKernel(const Camera* camera,
+                                                        const int start_index,
+                                                        uint* output_counter,
+                                                        SDFBlockDesc* output,
+                                                        VoxelContainer<T>* container) {
+      const uint bucket = start_index + blockIdx.x * blockDim.x + threadIdx.x;
+      if (bucket >= container->total_size_)
+        return;
+      const HashEntry entry = container->d_hashTable_[bucket];
+      if (entry.ptr != FREE_ENTRY && !container->isSDFBlockInCameraFrustum(camera, entry.pos))
+        streamOutHashEntry(bucket, output_counter, output, container);
+    }
 
-        if (entry.resolution == 0)
-          container->appendHeapHigh(entry.ptr / container->getNumVoxels(entry));
-        if (entry.resolution == 1)
-          container->appendHeapLow(entry.ptr / container->getNumVoxels(entry));
-        deleteHashEntry(bucket_id);
-#endif
-#ifdef RESOLVE_COLLISION
-        if (entry.offset != 0 || container->calculateHash(entry.pos) != bucket_id / container->hash_bucket_size_) {
-          if (container->deleteHashEntryElement(entry.pos)) {
-            uint addr      = atomicAdd(&d_outputCounter[0], 1);
-            d_output[addr] = desc;
-          }
-        } else {
-          uint addr      = atomicAdd(&d_outputCounter[0], 1);
-          d_output[addr] = desc;
-          if (entry.resolution == 0)
-            container->appendHeapHigh(entry.ptr / container->getNumVoxels(entry));
-          else if (entry.resolution == 1)
-            container->appendHeapLow(entry.ptr / container->getNumVoxels(entry));
-          deleteHashEntry(entry);
-        }
-#endif
-      }
+    template <typename T>
+    __global__ void integrateOutsideDepthBandKernel(const Camera* camera,
+                                                    const CUDAMatrixf* depth,
+                                                    const int row_begin,
+                                                    const int row_end,
+                                                    const int start_index,
+                                                    uint* output_counter,
+                                                    SDFBlockDesc* output,
+                                                    VoxelContainer<T>* container) {
+      const uint bucket = start_index + blockIdx.x * blockDim.x + threadIdx.x;
+      if (bucket >= container->total_size_)
+        return;
+      const HashEntry entry = container->d_hashTable_[bucket];
+      if (entry.ptr != FREE_ENTRY &&
+          !container->isSDFBlockInDepthBand(camera, depth, entry.pos, row_begin, row_end))
+        streamOutHashEntry(bucket, output_counter, output, container);
     }
 
     template <typename T>
@@ -73,6 +117,51 @@ namespace cupanutils {
           radius, camera_position, start_idx, d_SDF_block_counter_, d_SDFBlockDescOutput_, container_->d_instance_);
         CUDA_CHECK(cudaDeviceSynchronize());
       }
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrateFromGlobalHashPass1(
+      const Camera& camera, const int num_pass) {
+      const dim3 threads_per_block((n_threads * n_threads), 1);
+      const int stream_size = max_num_sdf_block_integrate_from_global_hash_;
+      const dim3 blocks((stream_size + threads_per_block.x - 1) / threads_per_block.x, 1);
+      const int start_index = num_pass * max_num_sdf_block_integrate_from_global_hash_;
+      integrateOutsideCameraFrustumKernel<<<blocks, threads_per_block>>>(
+        camera.deviceInstance(),
+        start_index,
+        d_SDF_block_counter_,
+        d_SDFBlockDescOutput_,
+        container_->d_instance_);
+      CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrateFromGlobalHashPass1(
+      const Camera& camera, const CUDAMatrixf& depth, const int num_pass) {
+      integrateFromGlobalHashPass1(camera, depth, 0, depth.rows(), num_pass);
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrateFromGlobalHashPass1(
+      const Camera& camera,
+      const CUDAMatrixf& depth,
+      const int row_begin,
+      const int row_end,
+      const int num_pass) {
+      const dim3 threads_per_block((n_threads * n_threads), 1);
+      const int stream_size = max_num_sdf_block_integrate_from_global_hash_;
+      const dim3 blocks((stream_size + threads_per_block.x - 1) / threads_per_block.x, 1);
+      const int start_index = num_pass * max_num_sdf_block_integrate_from_global_hash_;
+      integrateOutsideDepthBandKernel<<<blocks, threads_per_block>>>(
+        camera.deviceInstance(),
+        depth.deviceInstance(),
+        row_begin,
+        row_end,
+        start_index,
+        d_SDF_block_counter_,
+        d_SDFBlockDescOutput_,
+        container_->d_instance_);
+      CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     template <typename T>
@@ -117,8 +206,14 @@ namespace cupanutils {
         deleteHashEntry(bucket_id);
 #endif
 #ifdef RESOLVE_COLLISION
-        if (entry.offset != 0 || container->calculateHash(entry.pos) != bucket_id / container->hash_bucket_size_) {
-          if (container->deleteHashEntryElement(entry.pos)) {
+        const uint entry_hash = container->directional_tsdf_
+                                  ? container->calculateHash(entry.pos, static_cast<TSDFDirection>(entry.direction))
+                                  : container->calculateHash(entry.pos);
+        if (entry.offset != 0 || entry_hash != bucket_id / container->hash_bucket_size_) {
+          const bool deleted = container->directional_tsdf_
+                                 ? container->deleteHashEntryElement(entry.pos, static_cast<TSDFDirection>(entry.direction))
+                                 : container->deleteHashEntryElement(entry.pos);
+          if (deleted) {
             uint addr      = atomicAdd(&d_outputCounter[0], 1);
             d_output[addr] = desc;
           }
@@ -414,7 +509,10 @@ namespace cupanutils {
       entry.pos            = d_SDFBlockDescs[bucket_id].pos;
       entry.offset         = 0;
       entry.resolution     = d_SDFBlockDescs[bucket_id].resolution;
-      const HashEntry existing = container->getHashEntry(entry.pos);
+      entry.direction      = d_SDFBlockDescs[bucket_id].direction;
+      const HashEntry existing = container->directional_tsdf_
+                                   ? container->getHashEntry(entry.pos, static_cast<TSDFDirection>(entry.direction))
+                                   : container->getHashEntry(entry.pos);
       if (existing.ptr != FREE_ENTRY) {
         d_blocks_ptr[bucket_id] = existing.ptr;
         d_merge_blocks[bucket_id] = 1;
@@ -486,18 +584,19 @@ namespace cupanutils {
       const uint ptr                             = d_blocks_ptr[blockIdx.x];
       const T& input = d_SDFBlocks[input_offset + threadIdx.x];
       T& output = container->d_SDFBlocks_[ptr + threadIdx.x];
-      const bool input_observed = input.weight > 0 ||
-                                  (container->two_sided_surface_field_ && input.rgb.x > 0);
-      const bool output_observed = output.weight > 0 ||
-                                   (container->two_sided_surface_field_ && output.rgb.x > 0);
+      const bool input_observed = container->directional_tsdf_ ? input.sum_squared > 0.f : input.weight > 0;
+      const bool output_observed = container->directional_tsdf_ ? output.sum_squared > 0.f : output.weight > 0;
       if (merge_blocks[blockIdx.x] && input_observed) {
         if (output_observed) {
-          T merged;
-          if (container->two_sided_surface_field_)
-            combineTwoSidedSurfaceVoxel(output, input, container->integration_weight_max_, merged);
-          else
+          if (container->directional_tsdf_) {
+            output.sdf += input.sdf;
+            output.sum_squared += input.sum_squared;
+            output.weight = 1;
+          } else {
+            T merged;
             combineVoxel(output, input, container->integration_weight_max_, merged);
-          output = merged;
+            output = merged;
+          }
         } else {
           output = input;
         }
@@ -526,18 +625,19 @@ namespace cupanutils {
       voxel.sum_squared = __half2float(__ushort_as_half(secondary));
       voxel.rgb.x = compact.secondary_weight;
       T& output = container->d_SDFBlocks_[block_pointers[blockIdx.x] + threadIdx.x];
-      const bool voxel_observed = voxel.weight > 0 ||
-                                  (container->two_sided_surface_field_ && voxel.rgb.x > 0);
-      const bool output_observed = output.weight > 0 ||
-                                   (container->two_sided_surface_field_ && output.rgb.x > 0);
+      const bool voxel_observed = container->directional_tsdf_ ? voxel.sum_squared > 0.f : voxel.weight > 0;
+      const bool output_observed = container->directional_tsdf_ ? output.sum_squared > 0.f : output.weight > 0;
       if (merge_blocks[blockIdx.x] && voxel_observed) {
         if (output_observed) {
-          T merged;
-          if (container->two_sided_surface_field_)
-            combineTwoSidedSurfaceVoxel(output, voxel, container->integration_weight_max_, merged);
-          else
+          if (container->directional_tsdf_) {
+            output.sdf += voxel.sdf;
+            output.sum_squared += voxel.sum_squared;
+            output.weight = 1;
+          } else {
+            T merged;
             combineVoxel(output, voxel, container->integration_weight_max_, merged);
-          output = merged;
+            output = merged;
+          }
         } else {
           output = voxel;
         }

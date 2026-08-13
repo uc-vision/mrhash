@@ -35,6 +35,7 @@ inline constexpr float voxel_map_SDFBlocks_ratio                = 0.82;  // Mesh
 inline constexpr float mesh_ratio                               = 0.25;  // Fraction of GPU memory for mesh
 inline constexpr float radius_scale_chunk                       = 10.0;  // Scaling factor for chunk radius
 inline constexpr unsigned int max_streaming_blocks              = 65536; // Reusable GPU/CPU streaming batch capacity
+inline constexpr float directional_truncation_voxels            = 4.f;
 inline constexpr float gs_scaling_ratio                         = 0.20;  // Fraction of memory for Gaussian Splatting
 inline constexpr float FLOAT_EPSILON                            = 1e-6f; // Small epsilon for floating-point comparisons
 

@@ -4,6 +4,7 @@
 #include "voxel_data_structures.cuh"
 #include <cuda_fp16.h>
 #include <unordered_map>
+#include <vector>
 
 namespace data = cista::offset;
 
@@ -55,18 +56,25 @@ namespace cupanutils {
 
     class SDFBlockDesc {
     public:
-      __host__ __device__ SDFBlockDesc() : pos(make_int3(0, 0, 0)), ptr(-1), resolution(0) {
+      __host__ __device__ SDFBlockDesc() :
+        pos(make_int3(0, 0, 0)),
+        ptr(-1),
+        resolution(0),
+        direction(static_cast<signed char>(TSDFDirection::none)) {
       }
 
       __host__ __device__ SDFBlockDesc(const HashEntry& entry) {
         pos        = entry.pos;
         ptr        = entry.ptr;
         resolution = entry.resolution;
+        direction  = entry.direction;
       }
 
       bool operator<(const SDFBlockDesc& other) const {
         if (pos.x == other.pos.x) {
           if (pos.y == other.pos.y) {
+            if (pos.z == other.pos.z)
+              return direction < other.direction;
             return pos.z < other.pos.z;
           }
           return pos.y < other.pos.y;
@@ -75,24 +83,26 @@ namespace cupanutils {
       }
 
       bool operator==(const SDFBlockDesc& other) const {
-        return pos.x == other.pos.x && pos.y == other.pos.y && pos.z == other.pos.z;
+        return pos.x == other.pos.x && pos.y == other.pos.y && pos.z == other.pos.z && direction == other.direction;
       }
 
       struct HashSDFBlockDesc {
         size_t operator()(const SDFBlockDesc& other) const {
           const int3& v    = other.pos;
-          const size_t res = ((size_t) v.x * p0) ^ ((size_t) v.y * p1) ^ ((size_t) v.z * p2);
+          const size_t res = ((size_t) v.x * p0) ^ ((size_t) v.y * p1) ^ ((size_t) v.z * p2) ^
+                             (static_cast<size_t>(other.direction) * 83492791u);
           return res;
         }
       };
 
       auto cista_members() {
-        return std::tie(pos, ptr, resolution);
+        return std::tie(pos, ptr, resolution, direction);
       }
 
       int3 pos;
       int ptr;
       int resolution;
+      signed char direction;
     } __align__(16);
 
     template <typename T>
@@ -152,6 +162,26 @@ namespace cupanutils {
       ~ChunkDesc() = default;
 
       void addSDFBlock(const SDFBlockDesc& desc, const SDFBlock<T>& data) {
+        if (!compact_voxels_ && desc.direction != static_cast<signed char>(TSDFDirection::none)) {
+          const auto [existing, inserted] = block_indices_.try_emplace(desc, vecChunkDesc_.size());
+          if (!inserted) {
+            SDFBlock<T>& target = vecSDFBlock_[existing->second];
+            for (uint voxel_index = 0; voxel_index < data.data.size(); ++voxel_index) {
+              const T& input = data.data[voxel_index];
+              if (input.sum_squared == 0.f)
+                continue;
+              T& output = target.data[voxel_index];
+              if (output.sum_squared == 0.f)
+                output = input;
+              else {
+                output.sdf += input.sdf;
+                output.sum_squared += input.sum_squared;
+                output.weight = 1;
+              }
+            }
+            return;
+          }
+        }
         vecChunkDesc_.push_back(desc);
         if (compact_voxels_) {
           const size_t offset = vecCompactVoxels_.size();
@@ -234,6 +264,11 @@ namespace cupanutils {
         return vecChunkDesc_[i];
       }
 
+      int findSDFBlock(const SDFBlockDesc& description) const {
+        const auto found = block_indices_.find(description);
+        return found == block_indices_.end() ? -1 : static_cast<int>(found->second);
+      }
+
       void copySDFBlock(const uint i, T* output) const {
         if (compact_voxels_) {
           const CompactVoxel* block = vecCompactVoxels_.data() + i * total_sdf_block_size;
@@ -275,6 +310,8 @@ namespace cupanutils {
         if (compact_voxels_) {
           target.addCompactSDFBlock(
             vecChunkDesc_[index], vecCompactVoxels_.data() + index * total_sdf_block_size);
+        } else if (vecChunkDesc_[index].direction != static_cast<signed char>(TSDFDirection::none)) {
+          target.addSDFBlock(vecChunkDesc_[index], vecSDFBlock_[index]);
         } else {
           target.vecChunkDesc_.push_back(vecChunkDesc_[index]);
           target.vecSDFBlock_.push_back(std::move(vecSDFBlock_[index]));
@@ -299,6 +336,28 @@ namespace cupanutils {
           while (vecSDFBlock_.size() > remaining)
             vecSDFBlock_.pop_back();
         }
+      }
+
+      void removeSDFBlock(const uint index) {
+        const uint last = getNElements() - 1;
+        block_indices_.erase(vecChunkDesc_[index]);
+        if (index != last) {
+          vecChunkDesc_[index] = vecChunkDesc_[last];
+          if (compact_voxels_) {
+            CompactVoxel* first = vecCompactVoxels_.data() + index * total_sdf_block_size;
+            CompactVoxel* second = vecCompactVoxels_.data() + last * total_sdf_block_size;
+            std::swap_ranges(first, first + total_sdf_block_size, second);
+          } else {
+            vecSDFBlock_[index] = std::move(vecSDFBlock_[last]);
+          }
+          if (block_indices_.find(vecChunkDesc_[index]) != block_indices_.end())
+            block_indices_[vecChunkDesc_[index]] = index;
+        }
+        vecChunkDesc_.pop_back();
+        if (compact_voxels_)
+          vecCompactVoxels_.resize(last * total_sdf_block_size);
+        else
+          vecSDFBlock_.pop_back();
       }
 
       bool isStreamedOut() const {
@@ -374,11 +433,35 @@ namespace cupanutils {
 
       // ! stream out - in, wrapper for both
       void stream(const Eigen::Vector3f& camera_position, const float radius);
+      void stream(const Camera& camera, const Eigen::Isometry3f& camera_in_world);
+      void stream(const Camera& camera,
+                  const Eigen::Isometry3f& camera_in_world,
+                  const CUDAMatrixf& depth);
+      void stream(const Camera& camera,
+                  const Eigen::Isometry3f& camera_in_world,
+                  const CUDAMatrixf& depth,
+                  int row_begin,
+                  int row_end);
 
       // ! stream out - to host
       void streamOutToHostPass0(const float3& camera_pose, const float radius);
+      void streamOutToHostPass0(const Camera& camera);
+      void streamOutToHostPass0(const Camera& camera, const CUDAMatrixf& depth);
+      void streamOutToHostPass0(const Camera& camera,
+                                const CUDAMatrixf& depth,
+                                int row_begin,
+                                int row_end);
       void integrateFromGlobalHashPass1(const float radius, const float3& camera_position);
       void integrateFromGlobalHashPass1(const float radius, const float3& camera_position, const int num_pass);
+      void integrateFromGlobalHashPass1(const Camera& camera, const int num_pass);
+      void integrateFromGlobalHashPass1(const Camera& camera,
+                                        const CUDAMatrixf& depth,
+                                        const int num_pass);
+      void integrateFromGlobalHashPass1(const Camera& camera,
+                                        const CUDAMatrixf& depth,
+                                        int row_begin,
+                                        int row_end,
+                                        int num_pass);
       void integrateFromGlobalHashPass2(const uint num_SDF_block_desc);
 
       void streamAllOut(); // usually at the end
@@ -393,7 +476,29 @@ namespace cupanutils {
 
       // ! stream in - to device
       uint integrateInHash(const Eigen::Vector3f& camera_pose, float radius);
+      uint integrateInHash(const Camera& camera, const Eigen::Isometry3f& camera_in_world);
+      uint integrateInHash(const Camera& camera,
+                           const Eigen::Isometry3f& camera_in_world,
+                           const std::vector<float>& depth);
+      uint integrateInHash(const Camera& camera,
+                           const Eigen::Isometry3f& camera_in_world,
+                           const std::vector<float>& depth,
+                           int row_begin,
+                           int row_end);
       void streamInToGPU(const Eigen::Vector3f& camera_position, const float radius);
+      void streamInToGPU(const Camera& camera, const Eigen::Isometry3f& camera_in_world);
+      void streamInToGPU(const Camera& camera,
+                         const Eigen::Isometry3f& camera_in_world,
+                         const std::vector<float>& depth);
+      void streamInToGPU(const Camera& camera,
+                         const Eigen::Isometry3f& camera_in_world,
+                         const std::vector<float>& depth,
+                         int row_begin,
+                         int row_end);
+      bool streamInDone() const {
+        return stream_in_done_;
+      }
+      void mergeResidentBlocksFromHost();
       void streamInToGPUChunk(const Eigen::Vector3i& chunk);
       void streamInToGPUChunkNeighborhood(const Eigen::Vector3i& chunk, const int radius);
       void chunkToGlobalHashPass1(const uint num_sdf_blocks_descs,

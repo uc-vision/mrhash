@@ -1,710 +1,273 @@
 #include "geowrapper.h"
-#include "cuda_matrix.cuh"
+
 #include "serializer.h"
-#include "surface_normal_estimator/mad_tree.h"
+
 #include <algorithm>
+#include <functional>
 #include <malloc.h>
 #include <stdexcept>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace pygeowrapper {
 
-  GeoWrapper::GeoWrapper(float sdf_truncation,
-                         float sdf_truncation_scale,
-                         int integration_weight_sample,
-                         float virtual_voxel_size,
-                         int n_frames_invalidate_voxels,
-                         int voxel_extents_scale,
-                         bool viewer_active,
-                         float marching_cubes_threshold,
-                         uchar min_weight_threshold,
-                         float min_depth,
-                         float max_depth,
-                         const std::string& gs_optimization_param_path,
-                         float sdf_var_threshold,
-                         float vertices_merging_threshold,
-                         bool projective_sdf,
-                         bool two_sided_surface_field,
-                         bool allocate_mesh) :
-    sdf_truncation_(sdf_truncation),
-    sdf_truncation_scale_(sdf_truncation_scale),
-    integration_weight_sample_(integration_weight_sample),
-    integration_weight_max_(integration_weight_max),
-    virtual_voxel_size_(virtual_voxel_size),
-    linked_list_size_(linked_list_size),
-    n_frames_invalidate_voxels_(n_frames_invalidate_voxels),
-    voxel_extents_scale_(voxel_extents_scale),
-    min_weight_threshold_(min_weight_threshold),
-    sdf_var_threshold_(sdf_var_threshold),
-    vertices_merging_threshold_(vertices_merging_threshold),
-    camera_in_lidar_(Eigen::Isometry3f::Identity()),
-    gs_optimization_param_path_(gs_optimization_param_path) {
-    size_t free, total;
-    cudaError_t err = cudaMemGetInfo(&free, &total);
-    if (err != cudaSuccess) {
-      throw std::runtime_error("GeoWrapper::GeoWrapper | Failed to get CUDA memory info: " +
-                               std::string(cudaGetErrorString(err)));
-    }
+  using cupanutils::cugeoutils::Eig2CUDA;
+  using cupanutils::cugeoutils::DirectionalSurfaceData;
+  using cupanutils::cugeoutils::SurfaceVoxelData;
+  using cupanutils::cugeoutils::TriangleMeshData;
 
-    if (!gs_optimization_param_path.empty()) {
-      free *= gs_scaling_ratio;
-      gs_container_ = std::make_unique<cupanutils::cugeoutils::GeometricGaussianContainer>(gs_optimization_param_path_);
-    }
-    const float sdf_blocks_ratio = allocate_mesh ? SDFBlocks_ratio : voxel_map_SDFBlocks_ratio;
-    size_t to_alloc              = free * sdf_blocks_ratio;
-    const size_t sdf_block_bytes = allocate_mesh ? to_alloc * sdf_blocks_ratio : to_alloc;
-    num_sdf_blocks_ = sdf_block_bytes / (sizeof(cupanutils::cugeoutils::Voxel) * total_sdf_block_size);
-    hash_num_buckets_       = num_sdf_blocks_;
-    hash_bucket_size_       = hash_bucket_size;
-    max_num_triangles_mesh_ = allocate_mesh ? (to_alloc * mesh_ratio) / sizeof(cupanutils::cugeoutils::Triangle) : 0;
-    max_num_sdf_block_integrate_from_global_hash_ = std::min(num_sdf_blocks_, static_cast<int>(max_streaming_blocks));
+  namespace {
 
-    const Eigen::Vector3f voxel_extents = Eigen::Vector3f::Ones() * voxel_extents_scale;
-    uint initial_chunk_list_size        = 0;
+    struct Vector3fHash {
+      size_t operator()(const Eigen::Vector3f& value) const {
+        const char* data = reinterpret_cast<const char*>(value.data());
+        return std::hash<std::string_view>()(std::string_view(data, sizeof(float) * 3));
+      }
+    };
 
-    voxelhasher_ = std::make_unique<cupanutils::cugeoutils::GeometricVoxelContainer>(num_sdf_blocks_,
-                                                                                     hash_num_buckets_,
-                                                                                     0.f,
-                                                                                     sdf_truncation,
-                                                                                     sdf_truncation_scale,
-                                                                                     virtual_voxel_size,
-                                                                                     integration_weight_sample,
-                                                                                     min_weight_threshold,
-                                                                                     sdf_var_threshold,
-                                                                                     projective_sdf,
-                                                                                     two_sided_surface_field,
-                                                                                     false,
-                                                                                     "",
-                                                                                     "",
-                                                                                     "");
+    struct Vector3fEqual {
+      bool operator()(const Eigen::Vector3f& left, const Eigen::Vector3f& right) const {
+        return left == right;
+      }
+    };
 
-    streamer_ = std::make_unique<cupanutils::cugeoutils::GeometricStreamer>(
-      voxelhasher_.get(), false, "", "");
+  } // namespace
+
+  DirectionalVoxelMap::DirectionalVoxelMap(
+    const float voxel_size, const float minimum_depth, const float maximum_depth) :
+    voxel_size_(voxel_size),
+    minimum_depth_(minimum_depth),
+    maximum_depth_(maximum_depth) {
+    size_t free_bytes = 0;
+    size_t total_bytes;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const size_t voxel_bytes = sizeof(cupanutils::cugeoutils::Voxel) * total_sdf_block_size;
+    const size_t hash_bytes = sizeof(cupanutils::cugeoutils::HashEntry) * hash_bucket_size;
+    const size_t streaming_bytes =
+      2 * max_streaming_blocks * (voxel_bytes + sizeof(cupanutils::cugeoutils::SDFBlockDesc));
+    num_blocks_ = static_cast<int>(
+      (free_bytes - streaming_bytes) * voxel_map_SDFBlocks_ratio / (voxel_bytes + hash_bytes));
+    voxels_ = std::make_unique<cupanutils::cugeoutils::GeometricVoxelContainer>(
+      num_blocks_,
+      num_blocks_,
+      maximum_depth,
+      4.f * voxel_size,
+      0.f,
+      voxel_size,
+      1,
+      0,
+      0.f,
+      false,
+      true,
+      false,
+      "",
+      "",
+      "");
+    streamer_ = std::make_unique<cupanutils::cugeoutils::GeometricStreamer>(voxels_.get(), false, "", "");
     streamer_->create(
-      voxel_extents, max_num_sdf_block_integrate_from_global_hash_, initial_chunk_list_size, !allocate_mesh && sdf_var_threshold == 0.f);
-    if (allocate_mesh) {
-      mesh_extractor_ = std::make_unique<cupanutils::cugeoutils::GeometricMarchingCubes>(
-        marching_cubes_threshold, viewer_active, max_num_triangles_mesh_, vertices_merging_threshold);
-    }
-
-    setCamera(1.f, 1.f, 0.f, 0.f, 1, 1, min_depth, max_depth, 1);
+      Eigen::Vector3f::Ones(),
+      std::min(static_cast<uint>(num_blocks_), max_streaming_blocks),
+      0,
+      false);
+    setCamera(1.f, 1.f, 0.f, 0.f, 1, 1, 0);
   }
 
-  GeoWrapper::~GeoWrapper() {
+  void DirectionalVoxelMap::setCamera(
+    const float focal_x,
+    const float focal_y,
+    const float center_x,
+    const float center_y,
+    const int rows,
+    const int columns,
+    const int camera_model) {
+    Eigen::Matrix3f intrinsic;
+    intrinsic << focal_x, 0.f, center_x, 0.f, focal_y, center_y, 0.f, 0.f, 1.f;
+    camera_ = std::make_unique<cupanutils::cugeoutils::Camera>(
+      cupanutils::cugeoutils::CUDAMat3(intrinsic),
+      rows,
+      columns,
+      minimum_depth_,
+      maximum_depth_,
+      static_cast<cupanutils::cugeoutils::CameraModel>(camera_model));
   }
 
-  void GeoWrapper::setCurrPose(Eigen::Vector3f pose, Eigen::Vector4f orientation) {
-    // invert order for eigen constructor qw, qx, qy, qz
-    const Eigen::Quaternionf quat(orientation(3), orientation(0), orientation(1), orientation(2));
-    curr_pose_.setIdentity();
-    curr_pose_.linear()      = quat.toRotationMatrix();
-    curr_pose_.translation() = pose;
+  void DirectionalVoxelMap::setPose(
+    const Eigen::Vector3f translation, const Eigen::Vector4f quaternion_xyzw) {
+    pose_.setIdentity();
+    pose_.linear() = Eigen::Quaternionf(
+                       quaternion_xyzw.w(),
+                       quaternion_xyzw.x(),
+                       quaternion_xyzw.y(),
+                       quaternion_xyzw.z())
+                       .toRotationMatrix();
+    pose_.translation() = translation;
+    camera_->setCamInWorld(pose_.matrix());
   }
 
-  void GeoWrapper::setCameraInLidar(const Eigen::Matrix4f& camera_in_lidar) {
-    camera_in_lidar_ = camera_in_lidar;
-  }
-
-  void GeoWrapper::setCamera(const float fx,
-                             const float fy,
-                             const float cx,
-                             const float cy,
-                             const int rows,
-                             const int cols,
-                             const float min_depth,
-                             const float max_depth,
-                             const int camera_model) {
-    // create camera matrix for cuda stuff
-    Eigen::Matrix3f camera_matrix;
-    camera_matrix << fx, 0.f, cx, 0.f, fy, cy, 0.f, 0.f, 1.f;
-    cupanutils::cugeoutils::CUDAMat3 d_cam_K(camera_matrix);
-    voxelhasher_->setIntegrationDistance(max_depth);
-
-    const cupanutils::cugeoutils::CameraModel model = (cupanutils::cugeoutils::CameraModel) camera_model;
-    camera_ = std::make_unique<cupanutils::cugeoutils::Camera>(d_cam_K, rows, cols, min_depth, max_depth, model);
-  }
-
-  void GeoWrapper::compute() {
-    // set absolute pose
-    camera_->setCamInWorld(curr_pose_.matrix());
-
-    if (depth_img_.size()) {
-      // inverse projection to get point cloud once
-      if (!images_on_device_) {
-        depth_img_.toDevice();
-        rgb_img_.toDevice();
-      }
-    }
-
-    if (point_cloud_.size()) {
-      point_cloud_.toDevice();
-      eigenvectors_.toDevice();
-      weights_.toDevice();
-    }
-
-    if (voxelhasher_->getHeapHighFreeCount() <= stream_threshold * num_sdf_blocks_)
-      streamer_->stream(curr_pose_.translation(), camera_->maxDepth());
-
-    if (depth_img_.size() && rgb_img_.size()) {
-      voxelhasher_->integrate(depth_img_, rgb_img_, *camera_, n_frames_invalidate_voxels_);
-      if (gs_container_)
-        gs_container_->runGS(*camera_, *voxelhasher_, rgb_img_, depth_img_);
-    }
-
-    if (point_cloud_.size())
-      voxelhasher_->integrate(point_cloud_, eigenvectors_, weights_, *camera_, n_frames_invalidate_voxels_);
-  }
-
-  void GeoWrapper::extractMesh(const std::string& filename) {
-    mesh_extractor_->mesh_ready_ = false;
-    mesh_extractor_->mesh_cv_.notify_one();
-    streamer_->streamAllOut();
-    if (mesh_extractor_->max_num_triangles_mesh_ <= 0) {
-      std::cerr << "GeoWrapper::extractMesh | no triangles to extract" << std::endl;
+  void DirectionalVoxelMap::integrateDepthCUDA(CudaDepthImage input) {
+    const size_t rows = input.shape(0);
+    const size_t columns = input.shape(1);
+    depth_.resize(rows, columns);
+    CUDA_CHECK(cudaMemcpy(
+      depth_.data<cupanutils::cugeoutils::Device>(),
+      input.data(),
+      sizeof(float) * rows * columns,
+      cudaMemcpyDeviceToDevice));
+    voxels_->prepareDirectionalDepthMap(depth_, *camera_);
+    if (voxels_->allocateDirectionalDepthRows(depth_, *camera_, 0, rows)) {
+      streamer_->mergeResidentBlocksFromHost();
+      voxels_->fuseDirectionalDepthRows(depth_, *camera_, 0, rows);
+      voxels_->completeDirectionalDepthMap();
       return;
     }
-    mesh_extractor_->vertices_ = Eigen::MatrixXd();
-    mesh_extractor_->faces_    = Eigen::MatrixXi();
-    std::cout << "GeoWrapper::extractMesh | extracting..." << std::endl;
-    mesh_extractor_->merge_mesh_      = true;
-    const float radius                = radius_scale_chunk * camera_->maxDepth();
-    const int radiusi                 = (int) radius;
-    auto [min_grid_pos, max_grid_pos] = streamer_->computeBounds();
 
-    if (min_grid_pos.x() == max_grid_pos.x()) {
-      max_grid_pos.x() += 1;
-    }
-    if (min_grid_pos.y() == max_grid_pos.y()) {
-      max_grid_pos.y() += 1;
-    }
-    if (min_grid_pos.z() == max_grid_pos.z()) {
-      max_grid_pos.z() += 1;
-    }
+    const std::function<void(int, int)> integrate_rows = [&](const int row_begin, const int row_end) {
+      streamer_->stream(*camera_, pose_, depth_, row_begin, row_end);
+      if (streamer_->streamInDone() &&
+          voxels_->allocateDirectionalDepthRows(depth_, *camera_, row_begin, row_end)) {
+        streamer_->mergeResidentBlocksFromHost();
+        voxels_->fuseDirectionalDepthRows(depth_, *camera_, row_begin, row_end);
+        return;
+      }
+      if (row_end - row_begin == 1)
+        throw std::runtime_error("Directional TSDF image row exceeds GPU block capacity");
+      const int middle = row_begin + (row_end - row_begin) / 2;
+      integrate_rows(row_begin, middle);
+      integrate_rows(middle, row_end);
+    };
+    const int middle = rows / 2;
+    integrate_rows(0, middle);
+    integrate_rows(middle, rows);
+    voxels_->completeDirectionalDepthMap();
+  }
 
-    for (int x = min_grid_pos.x(); x < max_grid_pos.x(); x += radiusi) {
-      for (int y = min_grid_pos.y(); y < max_grid_pos.y(); y += radiusi) {
-        for (int z = min_grid_pos.z(); z < max_grid_pos.z(); z += radiusi) {
-          const Eigen::Vector3i chunk(x, y, z);
-          streamer_->streamInToGPU(streamer_->chunkToWorld(chunk), radius);
-          mesh_extractor_->extractMesh(*voxelhasher_);
-          if (mesh_extractor_->num_triangles_ > 0) {
-            mesh_extractor_->processTriangles();
-          }
-          streamer_->streamAllOut();
+  DirectionalSurfaceData DirectionalVoxelMap::extractSurface() {
+    streamer_->streamAllOut();
+    streamer_->rechunk(0.125f);
+    std::vector<Eigen::Vector3i> chunks;
+    float neighborhood_radius;
+    size_t maximum_neighborhood_blocks;
+    do {
+      chunks = streamer_->chunks();
+      neighborhood_radius = 3.1f * streamer_->getChunkRadiusInMeter();
+      maximum_neighborhood_blocks = 0;
+      for (const Eigen::Vector3i& owner : chunks) {
+        size_t neighborhood_blocks = 0;
+        for (const auto& [data_chunk, contents] : streamer_->getGrid()) {
+          if (streamer_->isChunkInSphere(
+                data_chunk, streamer_->chunkToWorld(owner), neighborhood_radius))
+            neighborhood_blocks += contents->getNElements();
         }
+        maximum_neighborhood_blocks = std::max(maximum_neighborhood_blocks, neighborhood_blocks);
       }
-    }
-
-    const auto& V = mesh_extractor_->vertices_;
-    const auto& F = mesh_extractor_->faces_;
-    const auto& C = mesh_extractor_->colors_;
-
-    std::ofstream ply(filename);
-    if (!ply.is_open()) {
-      std::cerr << "GeoWrapper::extractMesh | Failed to open file for writing: " << filename << std::endl;
-      return;
-    }
-
-    // Header
-    ply << "ply\n";
-    ply << "format ascii 1.0\n";
-    ply << "element vertex " << V.rows() << "\n";
-    ply << "property float x\n";
-    ply << "property float y\n";
-    ply << "property float z\n";
-    ply << "property uchar red\n";
-    ply << "property uchar green\n";
-    ply << "property uchar blue\n";
-    ply << "element face " << F.rows() << "\n";
-    ply << "property list uchar int vertex_indices\n";
-    ply << "end_header\n";
-
-    // Vertex data with colors
-    for (int i = 0; i < V.rows(); ++i) {
-      unsigned char color[3] = {(unsigned char) (C(i, 0)), (unsigned char) (C(i, 1)), (unsigned char) (C(i, 2))};
-
-      ply << V(i, 0) << " " << V(i, 1) << " " << V(i, 2) << " " << static_cast<int>(color[0]) << " " << static_cast<int>(color[1])
-          << " " << static_cast<int>(color[2]) << "\n";
-    }
-
-    // Faces
-    for (int i = 0; i < F.rows(); ++i) {
-      ply << "3 " << F(i, 0) << " " << F(i, 1) << " " << F(i, 2) << "\n";
-    }
-
-    ply.close();
-    std::cout << "GeoWrapper::extractMesh | written " << V.rows() << " vertices and " << F.rows() << " faces to " << filename
-              << std::endl;
-  }
-
-  void GeoWrapper::GSSavePointCloud(const std::string& folder) {
-    if (!gs_container_) {
-      std::cerr << "GeoWrapper::GSSavePointCloud | GS container not initialized" << std::endl;
-      return;
-    }
-    gs_container_->gs_model_.Save_ply(folder, voxelhasher_->num_integrated_frames_, true);
-    std::cout << "GeoWrapper::GSSavePointCloud | written gaussians to " << folder << std::endl;
-  }
-
-  void GeoWrapper::GSFinalOpt() {
-    if (gs_container_)
-      gs_container_->optimizeGSFinal();
-  }
-
-  void GeoWrapper::setRGBImage(nb::ndarray<uint8_t> input_rgb_array) {
-    images_on_device_ = false;
-    // check the dimensions of the input array
-    if (input_rgb_array.ndim() != 3) {
-      throw std::runtime_error("GeoWrapper::setRGBImage|input should be a 3D numpy array");
-    }
-
-    // get the dimensions of the array
-    const size_t rows     = input_rgb_array.shape(0);
-    const size_t cols     = input_rgb_array.shape(1);
-    const size_t channels = input_rgb_array.shape(2);
-
-    if (channels != 3) {
-      throw std::runtime_error("GeoWrapper::setRGBImage|input should have 3 channels");
-    }
-
-    uint8_t* ptr = input_rgb_array.data();
-
-    // resize the image to match the input array dimensions
-    rgb_img_.resize(rows, cols);
-
-    // populate the image
-    for (size_t r = 0; r < rows; ++r) {
-      for (size_t c = 0; c < cols; ++c) {
-        rgb_img_.at(r, c).x = ptr[r * cols * channels + c * channels];
-        rgb_img_.at(r, c).y = ptr[r * cols * channels + c * channels + 1];
-        rgb_img_.at(r, c).z = ptr[r * cols * channels + c * channels + 2];
-      }
-    }
-  }
-
-  void GeoWrapper::setRGBImageCUDA(CudaRGBImage input_rgb_array) {
-    images_on_device_ = true;
-    const size_t rows = input_rgb_array.shape(0);
-    const size_t cols = input_rgb_array.shape(1);
-    rgb_img_.resize(rows, cols);
-    CUDA_CHECK(cudaMemcpy(rgb_img_.data<cupanutils::cugeoutils::Device>(),
-                          input_rgb_array.data(),
-                          sizeof(uchar3) * rows * cols,
-                          cudaMemcpyDeviceToDevice));
-  }
-
-  void GeoWrapper::setRGBImage(const cv::Mat& input_rgb_image) {
-    images_on_device_ = false;
-    // check that the input is 3-channel 8-bit
-    if (input_rgb_image.type() != CV_8UC3) {
-      throw std::runtime_error("GeoWrapper::setRGBImage|input Mat should be CV_8UC3");
-    }
-
-    const int rows = input_rgb_image.rows;
-    const int cols = input_rgb_image.cols;
-
-    // resize the image to match the input dimensions
-    rgb_img_.resize(rows, cols);
-
-    // populate the image (OpenCV stores in BGR order by default)
-    for (int r = 0; r < rows; ++r) {
-      const uint8_t* row_ptr = input_rgb_image.ptr<uint8_t>(r);
-      for (int c = 0; c < cols; ++c) {
-        // Note: OpenCV typically uses BGR order, adjust if needed
-        rgb_img_.at(r, c).x = row_ptr[c * 3];     // B
-        rgb_img_.at(r, c).y = row_ptr[c * 3 + 1]; // G
-        rgb_img_.at(r, c).z = row_ptr[c * 3 + 2]; // R
-      }
-    }
-  }
-
-  void GeoWrapper::setDepthImage(nb::ndarray<float> input_depth_array) {
-    images_on_device_ = false;
-    // check the dimensions of the input array
-    if (input_depth_array.ndim() != 2) {
-      throw std::runtime_error("GeoWrapper::setDepthImage|input should be a 2D numpy array");
-    }
-
-    // get the dimensions of the array
-    const size_t rows = input_depth_array.shape(0);
-    const size_t cols = input_depth_array.shape(1);
-
-    // get a pointer to the data as a float*
-    float* ptr = input_depth_array.data();
-
-    // resize the matrix to match the input array dimensions
-    depth_img_.resize(rows, cols);
-    depth_img_.fill(0.f);
-    for (size_t r = 0; r < rows; ++r) {
-      for (size_t c = 0; c < cols; ++c) {
-        depth_img_.at(r, c) = ptr[r * cols + c];
-      }
-    }
-  }
-
-  void GeoWrapper::setDepthImageCUDA(CudaDepthImage input_depth_array) {
-    images_on_device_ = true;
-    const size_t rows = input_depth_array.shape(0);
-    const size_t cols = input_depth_array.shape(1);
-    depth_img_.resize(rows, cols);
-    CUDA_CHECK(cudaMemcpy(depth_img_.data<cupanutils::cugeoutils::Device>(),
-                          input_depth_array.data(),
-                          sizeof(float) * rows * cols,
-                          cudaMemcpyDeviceToDevice));
-  }
-
-  void GeoWrapper::setDepthImage(const cv::Mat& input_depth_image) {
-    images_on_device_ = false;
-    // check that the input is single-channel float
-    if (input_depth_image.type() != CV_32FC1) {
-      throw std::runtime_error("GeoWrapper::setDepthImage|input Mat should be CV_32FC1");
-    }
-
-    const int rows = input_depth_image.rows;
-    const int cols = input_depth_image.cols;
-
-    // resize the matrix to match the input dimensions
-    depth_img_.resize(rows, cols);
-    depth_img_.fill(0.f);
-
-    // populate the depth image using OpenCV's efficient row access
-    for (int r = 0; r < rows; ++r) {
-      const float* row_ptr = input_depth_image.ptr<float>(r);
-      for (int c = 0; c < cols; ++c) {
-        depth_img_.at(r, c) = row_ptr[c];
-      }
-    }
-  }
-
-  void GeoWrapper::setPointCloud(nb::ndarray<float> input_point_cloud_array, const bool compute_normals) {
-    if (input_point_cloud_array.ndim() != 2) {
-      throw std::runtime_error("GeoWrapper::setPointCloud|input should be a 2D numpy array");
-    }
-
-    const float* ptr        = input_point_cloud_array.data();
-    const size_t num_points = input_point_cloud_array.shape(0);
-
-    auto points = std::make_unique<std::vector<Eigen::Vector3d>>();
-
-    // Resize point_cloud_ before writing to it
-    point_cloud_.resize(num_points, 1);
-
-    // convert py::array_to std::vector<Eigen::Vector3f>
-    for (size_t n = 0; n < num_points; ++n) {
-      Eigen::Vector3d point;
-      point.x() = ptr[n * 3 + 0];
-      point.y() = ptr[n * 3 + 1];
-      point.z() = ptr[n * 3 + 2];
-      points->push_back(point);
-
-      point_cloud_.at(n).x = point.x();
-      point_cloud_.at(n).y = point.y();
-      point_cloud_.at(n).z = point.z();
-    }
-
-    eigenvectors_.resize(3 * num_points, 1);
-    weights_.resize(num_points, 1);
-
-    if (compute_normals) {
-      // build tree
-      MADtree tree(points.get(), points->begin(), points->end(), 0.4, 0.4, 0, 3, nullptr, nullptr);
-
-      // extract points and normals from mad-tree
-      LeafList leafs;
-
-      tree.getLeafs(std::back_inserter(leafs));
-
-      size_t n = 0;
-      for (auto& leaf : leafs) {
-        if (leaf->mean_.dot(leaf->eigenvectors_.col(0)) > 0)
-          leaf->eigenvectors_.col(0) *= -1.0;
-
-        // extract point from points vec considering leaf->begin and leaf->end
-        for (auto it = leaf->begin_; it != leaf->end_; ++it) {
-          eigenvectors_.at(3 * n).x     = leaf->eigenvectors_.col(0).x();
-          eigenvectors_.at(3 * n).y     = leaf->eigenvectors_.col(0).y();
-          eigenvectors_.at(3 * n).z     = leaf->eigenvectors_.col(0).z();
-          eigenvectors_.at(3 * n + 1).x = leaf->eigenvectors_.col(1).x();
-          eigenvectors_.at(3 * n + 1).y = leaf->eigenvectors_.col(1).y();
-          eigenvectors_.at(3 * n + 1).z = leaf->eigenvectors_.col(1).z();
-          eigenvectors_.at(3 * n + 2).x = leaf->eigenvectors_.col(2).x();
-          eigenvectors_.at(3 * n + 2).y = leaf->eigenvectors_.col(2).y();
-          eigenvectors_.at(3 * n + 2).z = leaf->eigenvectors_.col(2).z();
-          weights_.at(n)                = leaf->weight_;
-
-          n++;
-        }
-      }
-    }
-  }
-
-  void GeoWrapper::setPointCloud(const std::vector<Eigen::Vector3f>& input_point_cloud, bool compute_normals) {
-    if (input_point_cloud.empty()) {
-      std::cerr << "GeoWrapper::setPointCloud | empty input point cloud" << std::endl;
-      return;
-    }
-
-    const size_t num_points = input_point_cloud.size();
-
-    auto points = std::make_unique<std::vector<Eigen::Vector3d>>();
-
-    // Resize point_cloud_ before writing to it
-    point_cloud_.resize(num_points, 1);
-
-    for (size_t n = 0; n < num_points; ++n) {
-      Eigen::Vector3d point;
-      point.x() = input_point_cloud.at(n)(0);
-      point.y() = input_point_cloud.at(n)(1);
-      point.z() = input_point_cloud.at(n)(2);
-      points->push_back(point);
-
-      point_cloud_.at(n).x = point.x();
-      point_cloud_.at(n).y = point.y();
-      point_cloud_.at(n).z = point.z();
-    }
-
-    eigenvectors_.resize(3 * num_points, 1);
-    weights_.resize(num_points, 1);
-
-    if (compute_normals) {
-      // build tree
-      MADtree tree(points.get(), points->begin(), points->end(), 0.4, 0.4, 0, 3, nullptr, nullptr);
-
-      // extract points and normals from mad-tree
-      LeafList leafs;
-
-      tree.getLeafs(std::back_inserter(leafs));
-
-      size_t n = 0;
-      for (auto& leaf : leafs) {
-        if (leaf->mean_.dot(leaf->eigenvectors_.col(0)) > 0)
-          leaf->eigenvectors_.col(0) *= -1.0;
-
-        // extract point from points vec considering leaf->begin and leaf->end
-        for (auto it = leaf->begin_; it != leaf->end_; ++it) {
-          eigenvectors_.at(3 * n).x     = leaf->eigenvectors_.col(0).x();
-          eigenvectors_.at(3 * n).y     = leaf->eigenvectors_.col(0).y();
-          eigenvectors_.at(3 * n).z     = leaf->eigenvectors_.col(0).z();
-          eigenvectors_.at(3 * n + 1).x = leaf->eigenvectors_.col(1).x();
-          eigenvectors_.at(3 * n + 1).y = leaf->eigenvectors_.col(1).y();
-          eigenvectors_.at(3 * n + 1).z = leaf->eigenvectors_.col(1).z();
-          eigenvectors_.at(3 * n + 2).x = leaf->eigenvectors_.col(2).x();
-          eigenvectors_.at(3 * n + 2).y = leaf->eigenvectors_.col(2).y();
-          eigenvectors_.at(3 * n + 2).z = leaf->eigenvectors_.col(2).z();
-          weights_.at(n)                = leaf->weight_;
-
-          n++;
-        }
-      }
-    }
-  }
-
-  void GeoWrapper::setPointCloud(nb::ndarray<float> input_point_cloud, nb::ndarray<float> normals) {
-    if (input_point_cloud.ndim() != 2) {
-      throw std::runtime_error("GeoWrapper::setPointCloud|point cloud input should be a 2D numpy array");
-    }
-
-    if (normals.ndim() != 2) {
-      throw std::runtime_error("GeoWrapper::setPointCloud|normals input should be a 2D numpy array");
-    }
-
-    if (input_point_cloud.shape(0) != normals.shape(0)) {
-      throw std::runtime_error(
-        "GeoWrapper::setPointCloud|point_cloud input and normals input should have the same number of points");
-    }
-
-    const float* point_cloud_ptr = input_point_cloud.data();
-    const float* normals_ptr     = normals.data();
-    const size_t num_points      = input_point_cloud.shape(0);
-
-    point_cloud_.resize(num_points, 1);
-    eigenvectors_.resize(num_points, 1);
-
-    // convert py::array_to std::vector<Eigen::Vector3f>
-    for (size_t n = 0; n < num_points; ++n) {
-      point_cloud_.at(n).x  = point_cloud_ptr[n * 3 + 0];
-      point_cloud_.at(n).y  = point_cloud_ptr[n * 3 + 1];
-      point_cloud_.at(n).z  = point_cloud_ptr[n * 3 + 2];
-      eigenvectors_.at(n).x = normals_ptr[n * 3 + 0];
-      eigenvectors_.at(n).y = normals_ptr[n * 3 + 1];
-      eigenvectors_.at(n).z = normals_ptr[n * 3 + 2];
-    }
-  }
-
-  void GeoWrapper::setPointCloud(const std::vector<Eigen::Vector3f>& input_point_cloud,
-                                 const std::vector<Eigen::Vector3f>& input_normals) {
-    if (input_point_cloud.empty()) {
-      std::cerr << "GeoWrapper::setPointCloud | empty input point cloud" << std::endl;
-      return;
-    }
-    if (input_normals.empty()) {
-      std::cerr << "GeoWrapper::setPointCloud | empty input normals" << std::endl;
-      return;
-    }
-
-    if (input_point_cloud.size() != input_normals.size()) {
-      std::cerr << "GeoWrapper::setPointCloud | input point cloud size does not match input normal size" << std::endl;
-      return;
-    }
-
-    const size_t num_points = input_point_cloud.size();
-
-    point_cloud_.resize(num_points, 1);
-    eigenvectors_.resize(num_points, 1);
-
-    // convert py::array_to std::vector<Eigen::Vector3f>
-    for (size_t n = 0; n < num_points; ++n) {
-      point_cloud_.at(n).x  = input_point_cloud.at(n)(0);
-      point_cloud_.at(n).y  = input_point_cloud.at(n)(1);
-      point_cloud_.at(n).z  = input_point_cloud.at(n)(2);
-      eigenvectors_.at(n).x = input_normals.at(n)(0);
-      eigenvectors_.at(n).y = input_normals.at(n)(1);
-      eigenvectors_.at(n).z = input_normals.at(n)(2);
-    }
-  }
-
-  Eigen::MatrixX3f GeoWrapper::getPointCloud() {
-    Eigen::MatrixX3f point_cloud(point_cloud_.rows(), 3);
-    for (size_t r = 0; r < point_cloud_.rows(); ++r) {
-      point_cloud(r, 0) = point_cloud_.at(r).x;
-      point_cloud(r, 1) = point_cloud_.at(r).y;
-      point_cloud(r, 2) = point_cloud_.at(r).z;
-    }
-    return point_cloud;
-  }
-
-  Eigen::MatrixX3f GeoWrapper::getNormals() {
-    Eigen::MatrixX3f normals(eigenvectors_.rows() / 3, 3);
-    for (size_t r = 0; r < eigenvectors_.rows() / 3; ++r) {
-      normals(r, 0) = eigenvectors_.at<0>(r).x;
-      normals(r, 1) = eigenvectors_.at<0>(r).y;
-      normals(r, 2) = eigenvectors_.at<0>(r).z;
-    }
-    return normals;
-  }
-
-  void GeoWrapper::clearBuffers() {
-    streamer_->streamAllOut();
-    std::cout << "clearing buffers..." << std::endl;
-    streamer_->clearGrid();
-    streamer_->printStatistics();
-  }
-
-  void GeoWrapper::streamAllOut() {
-    streamer_->streamAllOut();
-  }
-
-  Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> GeoWrapper::getSurfaceVoxels(const float surface_band) {
-    return voxelhasher_->surfaceVoxels(surface_band);
-  }
-
-  Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
-  GeoWrapper::getTudfSurfaceVoxels(const int partition_count, const int partition_index) {
-    if (partition_count < 1 || partition_index < 0 || partition_index >= partition_count)
-      throw std::invalid_argument("Surface partition index must be within the positive partition count");
-    streamer_->streamAllOut();
-    streamer_->rechunk(0.5f);
-    std::vector<Eigen::Vector3i> chunks = streamer_->chunks();
-
-    using SurfaceVoxels = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+      if (maximum_neighborhood_blocks > static_cast<size_t>(num_blocks_ / 4))
+        streamer_->rechunk(0.5f);
+    } while (maximum_neighborhood_blocks > static_cast<size_t>(num_blocks_ / 4));
     if (chunks.empty())
-      return SurfaceVoxels(0, 5);
-
-    Eigen::Vector3i minimum_chunk = chunks.front();
-    Eigen::Vector3i maximum_chunk = chunks.front();
-    for (const Eigen::Vector3i& chunk : chunks) {
-      minimum_chunk = minimum_chunk.cwiseMin(chunk);
-      maximum_chunk = maximum_chunk.cwiseMax(chunk);
-    }
-    const Eigen::Vector3i chunk_spans = maximum_chunk - minimum_chunk;
-    Eigen::Index major_axis = 0;
-    chunk_spans.maxCoeff(&major_axis);
-    const int axis_chunk_count = maximum_chunk[major_axis] - minimum_chunk[major_axis] + 1;
-    const int partition_start = minimum_chunk[major_axis] + axis_chunk_count * partition_index / partition_count;
-    const int partition_end = minimum_chunk[major_axis] + axis_chunk_count * (partition_index + 1) / partition_count;
-    std::vector<Eigen::Vector3i> owner_chunks;
-    for (const Eigen::Vector3i& chunk : chunks) {
-      if (chunk[major_axis] >= partition_start && chunk[major_axis] < partition_end)
-        owner_chunks.push_back(chunk);
-    }
-    std::sort(owner_chunks.begin(), owner_chunks.end(), [major_axis](const Eigen::Vector3i& left, const Eigen::Vector3i& right) {
-      for (int offset = 0; offset < 3; ++offset) {
-        const Eigen::Index axis = (major_axis + offset) % 3;
-        if (left[axis] != right[axis])
-          return left[axis] < right[axis];
-      }
-      return false;
+      return DirectionalSurfaceData{SurfaceVoxelData(), TriangleMeshData()};
+    std::sort(chunks.begin(), chunks.end(), [](const Eigen::Vector3i& left, const Eigen::Vector3i& right) {
+      if (left.x() != right.x())
+        return left.x() < right.x();
+      if (left.y() != right.y())
+        return left.y() < right.y();
+      return left.z() < right.z();
     });
-    const int current_chunk_axis = streamer_->worldToChunks(curr_pose_.translation())[major_axis];
-    if (!owner_chunks.empty() &&
-        std::abs(current_chunk_axis - owner_chunks.back()[major_axis]) <
-          std::abs(current_chunk_axis - owner_chunks.front()[major_axis]))
-      std::reverse(owner_chunks.begin(), owner_chunks.end());
-
-    std::vector<SurfaceVoxels> chunk_voxels;
+    std::cout << "Directional extraction: " << chunks.size() << " chunks, at most "
+              << maximum_neighborhood_blocks << " resident blocks per neighborhood" << std::endl;
+    std::vector<SurfaceVoxelData> voxel_chunks;
+    std::vector<TriangleMeshData> mesh_chunks;
     Eigen::Index total_voxels = 0;
-    const float neighborhood_radius = 2.2f * streamer_->getChunkRadiusInMeter();
-    std::cout << "Extracting " << owner_chunks.size() << " TUDF chunks" << std::endl;
-    std::vector<size_t> last_use(chunks.size(), owner_chunks.size());
+    Eigen::Index total_faces = 0;
+    std::vector<size_t> last_use(chunks.size(), chunks.size());
     for (size_t data_index = 0; data_index < chunks.size(); ++data_index) {
-      for (size_t owner_index = 0; owner_index < owner_chunks.size(); ++owner_index) {
+      for (size_t owner_index = 0; owner_index < chunks.size(); ++owner_index) {
         if (streamer_->isChunkInSphere(
-              chunks[data_index], streamer_->chunkToWorld(owner_chunks[owner_index]), neighborhood_radius))
+              chunks[data_index], streamer_->chunkToWorld(chunks[owner_index]), neighborhood_radius))
           last_use[data_index] = owner_index;
       }
     }
-    std::vector<Eigen::Vector3i> unused_chunks;
-    for (size_t data_index = 0; data_index < chunks.size(); ++data_index) {
-      if (last_use[data_index] == owner_chunks.size()) {
-        unused_chunks.push_back(chunks[data_index]);
-        streamer_->eraseChunk(chunks[data_index]);
-      }
-    }
-    if (!unused_chunks.empty())
-      streamer_->discardChunks(unused_chunks);
-    for (size_t owner_index = 0; owner_index < owner_chunks.size(); ++owner_index) {
-      const Eigen::Vector3i& chunk = owner_chunks[owner_index];
-      streamer_->streamInToGPU(streamer_->chunkToWorld(chunk), neighborhood_radius);
-      SurfaceVoxels selected = voxelhasher_->tudfSurfaceVoxels(
-        cupanutils::cugeoutils::Eig2CUDA(chunk),
-        cupanutils::cugeoutils::Eig2CUDA(streamer_->getChunkExtents()));
-      total_voxels += selected.rows();
-      chunk_voxels.push_back(std::move(selected));
-      std::vector<Eigen::Vector3i> expired_chunks;
+    for (size_t owner_index = 0; owner_index < chunks.size(); ++owner_index) {
+      const Eigen::Vector3i owner = chunks[owner_index];
+      streamer_->streamInToGPU(streamer_->chunkToWorld(owner), neighborhood_radius);
+      SurfaceVoxelData selected_voxels = voxels_->directionalSurfaceVoxels(
+        Eig2CUDA(owner), Eig2CUDA(streamer_->getChunkExtents()));
+      TriangleMeshData selected_mesh = voxels_->directionalSurfaceMesh(
+        Eig2CUDA(owner), Eig2CUDA(streamer_->getChunkExtents()));
+      total_voxels += selected_voxels.indices.rows();
+      total_faces += selected_mesh.faces.rows();
+      voxel_chunks.push_back(std::move(selected_voxels));
+      mesh_chunks.push_back(std::move(selected_mesh));
+      std::vector<Eigen::Vector3i> expired;
       for (size_t data_index = 0; data_index < chunks.size(); ++data_index) {
         if (last_use[data_index] == owner_index) {
-          expired_chunks.push_back(chunks[data_index]);
+          expired.push_back(chunks[data_index]);
           streamer_->eraseChunk(chunks[data_index]);
         }
       }
-      if (!expired_chunks.empty())
-        streamer_->discardChunks(expired_chunks);
-      std::cout << "\rExtracting TUDF chunks: " << owner_index + 1 << '/' << owner_chunks.size() << std::flush;
+      if (!expired.empty())
+        streamer_->discardChunks(expired);
+      std::cout << "\rExtracting directional TSDF chunks: " << owner_index + 1 << '/' << chunks.size() << std::flush;
     }
     std::cout << std::endl;
     malloc_trim(0);
 
-    SurfaceVoxels surface_voxels(total_voxels, 5);
+    DirectionalSurfaceData result{SurfaceVoxelData(total_voxels), TriangleMeshData()};
     Eigen::Index offset = 0;
-    for (const SurfaceVoxels& selected : chunk_voxels) {
-      surface_voxels.middleRows(offset, selected.rows()) = selected;
-      offset += selected.rows();
+    for (const SurfaceVoxelData& chunk : voxel_chunks) {
+      result.voxels.indices.middleRows(offset, chunk.indices.rows()) = chunk.indices;
+      result.voxels.points.middleRows(offset, chunk.points.rows()) = chunk.points;
+      result.voxels.confidence.middleRows(offset, chunk.confidence.rows()) = chunk.confidence;
+      result.voxels.normals.middleRows(offset, chunk.normals.rows()) = chunk.normals;
+      offset += chunk.indices.rows();
     }
-    return surface_voxels;
+
+    std::unordered_map<Eigen::Vector3f, int, Vector3fHash, Vector3fEqual> vertex_indices;
+    vertex_indices.reserve(total_faces);
+    std::vector<Eigen::Vector3f> vertices;
+    std::vector<Eigen::Vector3i> faces;
+    vertices.reserve(total_faces);
+    faces.reserve(total_faces);
+    for (const TriangleMeshData& chunk : mesh_chunks) {
+      for (Eigen::Index face_index = 0; face_index < chunk.faces.rows(); ++face_index) {
+        Eigen::Vector3i face;
+        for (int corner = 0; corner < 3; ++corner) {
+          const Eigen::Vector3f position = chunk.vertices.row(chunk.faces(face_index, corner));
+          const auto [iterator, inserted] = vertex_indices.emplace(position, vertices.size());
+          if (inserted)
+            vertices.push_back(position);
+          face(corner) = iterator->second;
+        }
+        faces.push_back(face);
+      }
+    }
+    result.mesh = TriangleMeshData(vertices.size(), faces.size());
+    for (size_t index = 0; index < vertices.size(); ++index)
+      result.mesh.vertices.row(index) = vertices[index];
+    for (size_t index = 0; index < faces.size(); ++index)
+      result.mesh.faces.row(index) = faces[index];
+    return result;
   }
 
-  void GeoWrapper::serializeData(const std::string& filename_hash, const std::string& filename_voxel) {
-    streamer_->serializeData(filename_hash, filename_voxel);
+  int DirectionalVoxelMap::getNumBlocks() const {
+    return num_blocks_;
   }
 
-  void GeoWrapper::serializeGrid(const std::string& filename) {
+  int DirectionalVoxelMap::getFreeBlocks() {
+    return voxels_->getHeapHighFreeCount();
+  }
+
+  float DirectionalVoxelMap::getVoxelSize() const {
+    return voxel_size_;
+  }
+
+  void DirectionalVoxelMap::serializeGrid(const std::string& filename) {
+    streamer_->streamAllOut();
     cupanutils::cugeoutils::Serializer<cupanutils::cugeoutils::Voxel>::serialize(streamer_->grid_, filename);
   }
 
-  void GeoWrapper::deserializeGrid(const std::string& filename) {
+  void DirectionalVoxelMap::deserializeGrid(const std::string& filename) {
     cupanutils::cugeoutils::Serializer<cupanutils::cugeoutils::Voxel>::deserialize(streamer_->grid_, filename);
   }
-
-  // template class GeoWrapper<cupanutils::cugeoutils::Voxel>;
 
 } // namespace pygeowrapper

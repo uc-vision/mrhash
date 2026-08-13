@@ -24,14 +24,13 @@ add_executable(test_grid_serializer test_grid_serializer.cu)
 target_link_libraries(test_grid_serializer GTest::gtest_main ${GEOM_LIB_NAME})
 target_include_directories(test_grid_serializer PRIVATE ${PROJECT_SOURCE_DIR}/src/)
 
-add_executable(test_marching_cubes test_marching_cubes.cpp)
-target_link_libraries(test_marching_cubes GTest::gtest_main ${GEOM_LIB_NAME})
-target_include_directories(test_marching_cubes PRIVATE ${PROJECT_SOURCE_DIR}/src/)
-
-add_executable(test_two_sided_surface test_two_sided_surface.cu)
-target_link_libraries(test_two_sided_surface GTest::gtest_main)
-target_include_directories(test_two_sided_surface PRIVATE ${PROJECT_SOURCE_DIR}/src/)
-set_target_properties(test_two_sided_surface PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+add_executable(test_directional_tsdf test_directional_tsdf.cu)
+target_link_libraries(test_directional_tsdf GTest::gtest_main ${GEOM_LIB_NAME})
+target_include_directories(test_directional_tsdf PRIVATE ${PROJECT_SOURCE_DIR}/src/)
+set_target_properties(test_directional_tsdf PROPERTIES
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  CUDA_SEPARABLE_COMPILATION ON
+)
 
 include(GoogleTest)
 gtest_discover_tests(test_algebra_operations)
@@ -40,13 +39,12 @@ gtest_discover_tests(test_projections)
 gtest_discover_tests(test_hash_utils)
 gtest_discover_tests(test_streamer)
 gtest_discover_tests(test_grid_serializer)
-gtest_discover_tests(test_marching_cubes)
-gtest_discover_tests(test_two_sided_surface)
+gtest_discover_tests(test_directional_tsdf)
 
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/tests/  # Change to the build directory
     DEPENDS test_algebra_operations test_cuda_matrix test_projections
-            test_hash_utils test_streamer test_grid_serializer test_marching_cubes test_two_sided_surface
+            test_hash_utils test_streamer test_grid_serializer test_directional_tsdf
 )
 message(STATUS "CMAKE_BINARY_DIR: ${CMAKE_BINARY_DIR}")

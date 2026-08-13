@@ -8,6 +8,32 @@
 namespace cupanutils {
   namespace cugeoutils {
 
+    struct SurfaceVoxelData {
+      Eigen::Matrix<int, Eigen::Dynamic, 3, Eigen::RowMajor> indices;
+      Eigen::Matrix<float, Eigen::Dynamic, 3, Eigen::RowMajor> points;
+      Eigen::VectorXf confidence;
+      Eigen::Matrix<float, Eigen::Dynamic, 3, Eigen::RowMajor> normals;
+
+      explicit SurfaceVoxelData(const Eigen::Index vertex_count = 0) :
+        indices(vertex_count, 3), points(vertex_count, 3),
+        confidence(vertex_count),
+        normals(vertex_count, 3) {}
+    };
+
+    struct TriangleMeshData {
+      Eigen::Matrix<float, Eigen::Dynamic, 3, Eigen::RowMajor> vertices;
+      Eigen::Matrix<int, Eigen::Dynamic, 3, Eigen::RowMajor> faces;
+
+      explicit TriangleMeshData(
+        const Eigen::Index vertex_count = 0, const Eigen::Index face_count = 0) :
+        vertices(vertex_count, 3), faces(face_count, 3) {}
+    };
+
+    struct DirectionalSurfaceData {
+      SurfaceVoxelData voxels;
+      TriangleMeshData mesh;
+    };
+
     template <typename T, typename Enable = void>
     class VoxelContainer {
     public:
@@ -30,7 +56,7 @@ namespace cupanutils {
                                        const uchar min_weight_threshold,
                                        const float sdf_var_threshold,
                                        const bool projective_sdf,
-                                       const bool two_sided_surface_field,
+                                       const bool directional_tsdf,
                                        const bool write_timings,
                                        const std::string memory_allocation_filepath,
                                        const std::string int_profiler_name,
@@ -49,7 +75,7 @@ namespace cupanutils {
         min_weight_threshold_(min_weight_threshold),
         sdf_var_threshold_(sdf_var_threshold),
         projective_sdf_(projective_sdf),
-        two_sided_surface_field_(two_sided_surface_field),
+        directional_tsdf_(directional_tsdf),
         memory_allocation_filepath_(memory_allocation_filepath),
         integration_profiler_(int_profiler_name, write_timings),
         rendering_profiler_(rendering_profiler_name, write_timings) {
@@ -82,6 +108,7 @@ namespace cupanutils {
         CUDA_CHECK(cudaMalloc((void**) &d_hashTableBucketMutex_, sizeof(int) * hash_num_buckets_));
         CUDA_CHECK(cudaMalloc((void**) &d_heapCounterHigh_, sizeof(int)));
         CUDA_CHECK(cudaMalloc((void**) &d_heapCounterLow_, sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void**) &d_directionalAllocationFailed_, sizeof(uint)));
         CUDA_CHECK(cudaMalloc((void**) &d_SDFBlocks_, sizeof(T) * num_sdf_blocks_ * voxel_block_volume_));
         CUDA_CHECK(cudaMalloc((void**) &d_weight_, sizeof(uchar)));
 
@@ -161,6 +188,9 @@ namespace cupanutils {
         if (d_heapCounterLow_ != nullptr) {
           CUDA_CHECK(cudaFree(d_heapCounterLow_));
         }
+        if (d_directionalAllocationFailed_ != nullptr) {
+          CUDA_CHECK(cudaFree(d_directionalAllocationFailed_));
+        }
         if (d_SDFBlocks_ != nullptr) {
           CUDA_CHECK(cudaFree(d_SDFBlocks_));
         }
@@ -181,6 +211,21 @@ namespace cupanutils {
                                   const CUDAVectorf weights,
                                   const Camera& camera);
       __host__ void integrateDepthMap(const CUDAMatrixf& depth_img, const CUDAMatrixuc3& rgb_img, const Camera& camera);
+      __host__ bool integrateDirectionalDepthMap(const CUDAMatrixf& depth_img, const Camera& camera);
+      __host__ void prepareDirectionalDepthMap(const CUDAMatrixf& depth_img, const Camera& camera);
+      __host__ bool allocateDirectionalDepthRows(const CUDAMatrixf& depth_img,
+                                                 const Camera& camera,
+                                                 int row_begin,
+                                                 int row_end);
+      __host__ void fuseDirectionalDepthRows(const CUDAMatrixf& depth_img,
+                                             const Camera& camera,
+                                             int row_begin,
+                                             int row_end);
+      __host__ bool integrateDirectionalDepthRows(const CUDAMatrixf& depth_img,
+                                                  const Camera& camera,
+                                                  int row_begin,
+                                                  int row_end);
+      __host__ void completeDirectionalDepthMap();
       __host__ void reintegrateDepthMap(const CUDAMatrixf& depth_img, const CUDAMatrixuc3& rgb_img, const Camera& camera);
       __host__ void
       integrate3D(const CUDAVectorf3& point_cloud, const CUDAVectorf3& normals, const CUDAVectorf& weights, const Camera& camera);
@@ -200,6 +245,8 @@ namespace cupanutils {
       __host__ Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> surfaceVoxels(float surface_band);
       __host__ Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
       tudfSurfaceVoxels(const int3& owner_chunk, const float3& chunk_extents);
+      __host__ SurfaceVoxelData directionalSurfaceVoxels(const int3& owner_chunk, const float3& chunk_extents);
+      __host__ TriangleMeshData directionalSurfaceMesh(const int3& owner_chunk, const float3& chunk_extents);
       __host__ void garbageCollect(const Camera& camera, const int max_num_frames);
 
       // some internal methods
@@ -220,11 +267,21 @@ namespace cupanutils {
       __device__ void appendHeapHigh(const uint ptr);
       __device__ void appendHeapLow(const uint ptr);
       __device__ bool deleteHashEntryElement(const int3& sdf_block);
+      __device__ bool deleteHashEntryElement(const int3& sdf_block, TSDFDirection direction);
       __device__ bool isSDFBlockInCameraFrustumApprox(const Camera* camera, const int3& sdf_block);
+      __device__ bool isSDFBlockInCameraFrustum(const Camera* camera, const int3& sdf_block);
+      __device__ bool isSDFBlockInDepthBand(const Camera* camera,
+                                            const CUDAMatrixf* depth,
+                                            const int3& sdf_block,
+                                            int row_begin,
+                                            int row_end);
       __device__ uint64_t calculateHash(const int3& virtual_voxel_pos) const;
+      __device__ uint64_t calculateHash(const int3& virtual_voxel_pos, TSDFDirection direction) const;
       __device__ HashEntry getHashEntry(const int3& sdf_block) const;
+      __device__ HashEntry getHashEntry(const int3& sdf_block, TSDFDirection direction) const;
       __device__ HashEntry getHashEntryReintegrate(const int3& sdf_block) const;
       __device__ T getVoxel(const int3& virtual_voxel_pos) const;
+      __device__ T getVoxel(const int3& virtual_voxel_pos, TSDFDirection direction) const;
       __device__ T getVoxel(const float3& pos) const;
       __device__ T getVoxel(const int3& virtual_voxel_pos, int& block_resolution) const;
       __device__ T getVoxel(const float3& pos, int& block_resolution) const;
@@ -235,6 +292,7 @@ namespace cupanutils {
       __device__ float getVoxelSize(const int3& pos) const;
       __device__ float getVoxelSize(const float3& pos) const;
       __device__ int allocBlock(const int3& pos, const int resolution = 0);
+      __device__ int allocDirectionalBlock(const int3& pos, TSDFDirection direction);
       __device__ int reallocBlock(const int3& pos, const int resolution = 0);
       __device__ bool insertHashEntry(HashEntry entry);
       __device__ bool trilinearInterpolation(const float3& pos, float& dist) const;
@@ -264,6 +322,7 @@ namespace cupanutils {
       uint* d_num_reintegrate_       = nullptr;    // single uint keeping track of num blocks to be reintegrated
       int* d_heapCounterHigh_        = nullptr;    // single int keeping track of num blocks allocated
       int* d_heapCounterLow_         = nullptr;    // single int keeping track of num blocks allocated
+      uint* d_directionalAllocationFailed_ = nullptr;
       int* d_hashDecision_           = nullptr;    // remove noisy elements, bookep elements to be removed because noisy, follows compactHashTable order
       HashEntry* d_hashTable_        = nullptr;    // hash that stores pointers to sdf blocks
       HashEntry* d_compactHashTable_ = nullptr;    // same as before except that only valid pointers are there
@@ -275,11 +334,13 @@ namespace cupanutils {
       uchar min_weight_threshold_    = 0;          // threshold weight for trilinearinterpolation
       float sdf_var_threshold_       = 0.f;        // threshold sdf variance for voxel merging
       bool projective_sdf_           = false;      // wheter to use projection or non-projective sdf
+      bool directional_tsdf_        = false;
       bool two_sided_surface_field_  = false;
       // clang-format on
 
       // query
       CUDAMatrixu64 depth_buff;
+      CUDAMatrixf3 directional_normals_;
       bool init_buff = true;
 
       // varying

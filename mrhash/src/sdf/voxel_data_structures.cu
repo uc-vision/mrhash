@@ -98,22 +98,26 @@ namespace cupanutils {
 
     template <typename T>
     __device__ int VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::consumeHeapHigh() {
-      int addr = atomicSub(&d_heapCounterHigh_[0], 1);
-
-      if (addr < 0)
-        return -1;
-
-      return d_heap_high_[addr];
+      int address = atomicAdd(d_heapCounterHigh_, 0);
+      while (address >= 0) {
+        const int previous = atomicCAS(d_heapCounterHigh_, address, address - 1);
+        if (previous == address)
+          return d_heap_high_[address];
+        address = previous;
+      }
+      return -1;
     }
 
     template <typename T>
     __device__ int VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::consumeHeapLow() {
-      int addr = atomicSub(&d_heapCounterLow_[0], 1);
-
-      if (addr < 0)
-        return -1;
-
-      return d_heap_low_[addr];
+      int address = atomicAdd(d_heapCounterLow_, 0);
+      while (address >= 0) {
+        const int previous = atomicCAS(d_heapCounterLow_, address, address - 1);
+        if (previous == address)
+          return d_heap_low_[address];
+        address = previous;
+      }
+      return -1;
     }
 
     template <typename T>
@@ -139,6 +143,54 @@ namespace cupanutils {
         float3 world_point     = virtualVoxelPosToWorld(virtual_voxel_size_, virtual_voxel_pos);
         if (camera->isInCameraFrustumApprox(world_point))
           return true;
+      }
+      return false;
+    }
+
+    template <typename T>
+    __device__ bool
+    VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::isSDFBlockInCameraFrustum(const Camera* camera,
+                                                                                                const int3& sdf_block) {
+      for (int index = 0; index < vertex_offset_camera; ++index) {
+        const int3 virtual_voxel = SDFBlockToVirtualVoxelPos(sdf_block) + vert_offset[index];
+        const float3 world = virtualVoxelPosToWorld(virtual_voxel_size_, virtual_voxel);
+        const float3 camera_point = camera->camInWorld().inverse() * world;
+        int2 pixel;
+        if (camera->projectPoint(camera_point, pixel))
+          return true;
+      }
+      return false;
+    }
+
+    template <typename T>
+    __device__ bool VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::isSDFBlockInDepthBand(
+      const Camera* camera,
+      const CUDAMatrixf* depth,
+      const int3& sdf_block,
+      const int row_begin,
+      const int row_end) {
+      const float band =
+        (directional_truncation_voxels + 1.7320508075688772f * (sdf_block_size - 1)) * virtual_voxel_size_;
+      for (int z_index = 0; z_index < 3; ++z_index) {
+        for (int y_index = 0; y_index < 3; ++y_index) {
+          for (int x_index = 0; x_index < 3; ++x_index) {
+            const int3 offset = make_int3(x_index * (sdf_block_size - 1) / 2,
+                                          y_index * (sdf_block_size - 1) / 2,
+                                          z_index * (sdf_block_size - 1) / 2);
+            const int3 virtual_voxel = SDFBlockToVirtualVoxelPos(sdf_block) + offset;
+            const float3 world = virtualVoxelPosToWorld(virtual_voxel_size_, virtual_voxel);
+            const float3 camera_point = camera->camInWorld().inverse() * world;
+            int2 pixel;
+            if (!camera->projectPoint(camera_point, pixel))
+              continue;
+            if (pixel.x < row_begin || pixel.x >= row_end)
+              continue;
+            const float measured_depth = depth->at<1>(pixel.x, pixel.y);
+            if (measured_depth >= camera->minDepth() && measured_depth <= camera->maxDepth() &&
+                fabsf(camera->getDepth(camera_point) - measured_depth) <= band)
+              return true;
+          }
+        }
       }
       return false;
     }
@@ -194,6 +246,34 @@ namespace cupanutils {
     }
 
     template <typename T>
+    __device__ HashEntry VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::getHashEntry(
+      const int3& sdf_block, const TSDFDirection direction) const {
+      HashEntry entry;
+      entry.pos = sdf_block;
+      const uint64_t hash = calculateHash(sdf_block, direction);
+      for (uint bucket_offset = 0; bucket_offset < hash_bucket_size_; ++bucket_offset) {
+        const HashEntry current = d_hashTable_[hash * hash_bucket_size_ + bucket_offset];
+        if (current.pos.x == sdf_block.x && current.pos.y == sdf_block.y && current.pos.z == sdf_block.z &&
+            current.direction == static_cast<signed char>(direction) && current.ptr != FREE_ENTRY)
+          return current;
+      }
+#ifdef RESOLVE_COLLISION
+      const uint bucket_last = (hash + 1) * hash_bucket_size_ - 1;
+      uint index = bucket_last;
+      for (int iteration = 0; iteration < linked_list_size_; ++iteration) {
+        const HashEntry current = d_hashTable_[index];
+        if (current.pos.x == sdf_block.x && current.pos.y == sdf_block.y && current.pos.z == sdf_block.z &&
+            current.direction == static_cast<signed char>(direction) && current.ptr != FREE_ENTRY)
+          return current;
+        if (current.offset == 0)
+          break;
+        index = (bucket_last + current.offset) % total_size_;
+      }
+#endif
+      return entry;
+    }
+
+    template <typename T>
     __device__ HashEntry
     VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::getHashEntryReintegrate(const int3& sdf_block) const {
       HashEntry entry;
@@ -227,6 +307,17 @@ namespace cupanutils {
     }
 
     template <typename T>
+    __device__ uint64_t VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::calculateHash(
+      const int3& position, const TSDFDirection direction) const {
+      const unsigned int x = static_cast<unsigned int>(position.x);
+      const unsigned int y = static_cast<unsigned int>(position.y);
+      const unsigned int z = static_cast<unsigned int>(position.z);
+      const unsigned int d = static_cast<unsigned int>(static_cast<signed char>(direction));
+      return ((x * static_cast<unsigned int>(p0)) ^ (y * static_cast<unsigned int>(p1)) ^
+              (z * static_cast<unsigned int>(p2)) ^ (d * 83492791u)) % hash_num_buckets_;
+    }
+
+    template <typename T>
     __device__ T VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::getVoxel(const int3& virtual_voxel_pos) const {
       T v;
       const HashEntry& entry = getHashEntry(virtualVoxelPosToSDFBlock(virtual_voxel_pos, virtual_voxel_size_, voxel_extents_));
@@ -239,6 +330,17 @@ namespace cupanutils {
         v = d_SDFBlocks_[entry.ptr + virtualVoxelPosToSDFBlockIndex(virtual_voxel_pos, sdf_block_size / scaling_factor)];
         return v;
       }
+    }
+
+    template <typename T>
+    __device__ T VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::getVoxel(
+      const int3& virtual_voxel_pos, const TSDFDirection direction) const {
+      const int3 block = virtualVoxelPosToSDFBlock(
+        virtual_voxel_pos, virtual_voxel_size_, voxel_extents_);
+      const HashEntry entry = getHashEntry(block, direction);
+      if (entry.ptr == FREE_ENTRY)
+        return T();
+      return d_SDFBlocks_[entry.ptr + virtualVoxelPosToSDFBlockIndex(virtual_voxel_pos)];
     }
     template <typename T>
     __device__ T VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::getVoxel(const int3& virtual_voxel_pos,
@@ -1680,6 +1782,75 @@ namespace cupanutils {
     }
 
     template <typename T>
+    __device__ int VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::allocDirectionalBlock(
+      const int3& position, const TSDFDirection direction) {
+      uint hash = calculateHash(position, direction);
+      const uint bucket_start = hash * hash_bucket_size_;
+      int first_empty = -1;
+      for (uint bucket_offset = 0; bucket_offset < hash_bucket_size_; ++bucket_offset) {
+        const uint index = bucket_start + bucket_offset;
+        const HashEntry current = d_hashTable_[index];
+        if (current.pos.x == position.x && current.pos.y == position.y && current.pos.z == position.z &&
+            current.direction == static_cast<signed char>(direction) && current.ptr != FREE_ENTRY)
+          return -1;
+        if (first_empty == -1 && current.ptr == FREE_ENTRY)
+          first_empty = index;
+      }
+#ifdef RESOLVE_COLLISION
+      const uint bucket_last = (hash + 1) * hash_bucket_size_ - 1;
+      uint index = bucket_last;
+      HashEntry current;
+      for (int iteration = 0; iteration < linked_list_size_; ++iteration) {
+        current = d_hashTable_[index];
+        if (current.pos.x == position.x && current.pos.y == position.y && current.pos.z == position.z &&
+            current.direction == static_cast<signed char>(direction) && current.ptr != FREE_ENTRY)
+          return -1;
+        if (current.offset == 0)
+          break;
+        index = (bucket_last + current.offset) % total_size_;
+      }
+#endif
+      if (first_empty != -1) {
+        if (atomicExch(&d_hashTableBucketMutex_[hash], LOCK_ENTRY) != LOCK_ENTRY) {
+          HashEntry& entry = d_hashTable_[first_empty];
+          const int pointer = consumeHeapHigh();
+          if (pointer < 0)
+            return -2;
+          entry.pos = position;
+          entry.offset = NO_OFFSET;
+          entry.ptr = pointer * total_sdf_block_size;
+          entry.resolution = 0;
+          entry.direction = static_cast<signed char>(direction);
+        }
+        return first_empty;
+      }
+#ifdef RESOLVE_COLLISION
+      for (int offset = 1; offset < linked_list_size_; ++offset) {
+        index = (bucket_last + offset) % total_size_;
+        if ((offset % hash_bucket_size_) == 0 || d_hashTable_[index].ptr != FREE_ENTRY)
+          continue;
+        if (atomicExch(&d_hashTableBucketMutex_[hash], LOCK_ENTRY) == LOCK_ENTRY)
+          return -1;
+        const uint overflow_hash = index / hash_bucket_size_;
+        if (atomicExch(&d_hashTableBucketMutex_[overflow_hash], LOCK_ENTRY) == LOCK_ENTRY)
+          return -1;
+        const int pointer = consumeHeapHigh();
+        if (pointer < 0)
+          return -2;
+        HashEntry& entry = d_hashTable_[index];
+        entry.pos = position;
+        entry.offset = d_hashTable_[bucket_last].offset;
+        entry.ptr = pointer * total_sdf_block_size;
+        entry.resolution = 0;
+        entry.direction = static_cast<signed char>(direction);
+        d_hashTable_[bucket_last].offset = offset;
+        return index;
+      }
+#endif
+      return -1;
+    }
+
+    template <typename T>
     __device__ int VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::reallocBlock(const int3& pos,
                                                                                                  const int resolution) {
       uint h        = calculateHash(pos);    // hash bucket
@@ -2889,6 +3060,58 @@ namespace cupanutils {
     }
 
     template <typename T>
+    __device__ bool VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::deleteHashEntryElement(
+      const int3& position, const TSDFDirection direction) {
+      const uint hash = calculateHash(position, direction);
+      const uint bucket_start = hash * hash_bucket_size_;
+      for (uint bucket_offset = 0; bucket_offset < hash_bucket_size_; ++bucket_offset) {
+        const uint index = bucket_start + bucket_offset;
+        const HashEntry current = d_hashTable_[index];
+        if (current.pos.x != position.x || current.pos.y != position.y || current.pos.z != position.z ||
+            current.direction != static_cast<signed char>(direction) || current.ptr == FREE_ENTRY)
+          continue;
+#ifdef RESOLVE_COLLISION
+        if (current.offset != 0) {
+          if (atomicExch(&d_hashTableBucketMutex_[hash], LOCK_ENTRY) == LOCK_ENTRY)
+            return false;
+          appendHeapHigh(current.ptr / total_sdf_block_size);
+          const uint next_index = (index + current.offset) % total_size_;
+          d_hashTable_[index] = d_hashTable_[next_index];
+          deleteHashEntry(d_hashTable_[next_index]);
+        } else
+#endif
+        {
+          appendHeapHigh(current.ptr / total_sdf_block_size);
+          deleteHashEntry(d_hashTable_[index]);
+        }
+        return true;
+      }
+#ifdef RESOLVE_COLLISION
+      const uint bucket_last = (hash + 1) * hash_bucket_size_ - 1;
+      uint previous_index = bucket_last;
+      HashEntry previous = d_hashTable_[previous_index];
+      uint index = (bucket_last + previous.offset) % total_size_;
+      for (int iteration = 0; iteration < linked_list_size_ && previous.offset != 0; ++iteration) {
+        const HashEntry current = d_hashTable_[index];
+        if (current.pos.x == position.x && current.pos.y == position.y && current.pos.z == position.z &&
+            current.direction == static_cast<signed char>(direction) && current.ptr != FREE_ENTRY) {
+          if (atomicExch(&d_hashTableBucketMutex_[hash], LOCK_ENTRY) == LOCK_ENTRY)
+            return false;
+          appendHeapHigh(current.ptr / total_sdf_block_size);
+          deleteHashEntry(d_hashTable_[index]);
+          previous.offset = current.offset;
+          d_hashTable_[previous_index] = previous;
+          return true;
+        }
+        previous_index = index;
+        previous = current;
+        index = (bucket_last + current.offset) % total_size_;
+      }
+#endif
+      return false;
+    }
+
+    template <typename T>
     __global__ void garbageCollectFreeKernel(VoxelContainer<T>* container) {
       // const uint hashIdx = blockIdx.x;
       const uint idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3186,7 +3409,9 @@ namespace cupanutils {
     // ! entry must be modifiable, but just inside the scope of this function, not actually returned
     template <typename T>
     __device__ bool VoxelContainer<T, std::enable_if_t<is_voxel_derived<T>::value>>::insertHashEntry(HashEntry entry) {
-      uint h  = calculateHash(entry.pos);
+      uint h  = directional_tsdf_
+                  ? calculateHash(entry.pos, static_cast<TSDFDirection>(entry.direction))
+                  : calculateHash(entry.pos);
       uint hp = h * hash_bucket_size_;
 
       for (uint j = 0; j < hash_bucket_size_; ++j) {

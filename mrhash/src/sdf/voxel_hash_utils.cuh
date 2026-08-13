@@ -25,6 +25,40 @@ namespace cupanutils {
       }
     };
 
+    enum class TSDFDirection : signed char {
+      x_positive = 0,
+      x_negative = 1,
+      y_positive = 2,
+      y_negative = 3,
+      z_positive = 4,
+      z_negative = 5,
+      none = -1,
+    };
+
+    inline constexpr int directional_tsdf_count = 6;
+
+#ifdef __CUDACC__
+    __host__ __device__ inline float3 directionVector(const TSDFDirection direction) {
+      switch (direction) {
+        case TSDFDirection::x_positive:
+          return make_float3(1.f, 0.f, 0.f);
+        case TSDFDirection::x_negative:
+          return make_float3(-1.f, 0.f, 0.f);
+        case TSDFDirection::y_positive:
+          return make_float3(0.f, 1.f, 0.f);
+        case TSDFDirection::y_negative:
+          return make_float3(0.f, -1.f, 0.f);
+        case TSDFDirection::z_positive:
+          return make_float3(0.f, 0.f, 1.f);
+        case TSDFDirection::z_negative:
+          return make_float3(0.f, 0.f, -1.f);
+        case TSDFDirection::none:
+          return make_float3(0.f);
+      }
+      return make_float3(0.f);
+    }
+#endif
+
     __host__ __device__ inline uchar twoSidedSurfaceWeight(const Voxel& voxel) {
       return voxel.weight;
     }
@@ -152,11 +186,13 @@ namespace cupanutils {
         offset     = NO_OFFSET;
         ptr        = FREE_ENTRY;
         resolution = 0;
+        direction  = static_cast<signed char>(TSDFDirection::none);
       }
       int3 pos;    // hash position (lower left corner of SDFBlock))
       uint offset; // offset for collisions
       int ptr;     // pointer into heap to SDFBlock
       int resolution;
+      signed char direction;
     };
 
     struct RayCastSample {
@@ -324,6 +360,7 @@ namespace cupanutils {
       hashEntry.pos    = make_int3(0, 0, 0);
       hashEntry.offset = NO_OFFSET;
       hashEntry.ptr    = FREE_ENTRY;
+      hashEntry.direction = static_cast<signed char>(TSDFDirection::none);
     }
 
     template <typename T>

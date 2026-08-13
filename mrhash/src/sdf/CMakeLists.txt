@@ -4,29 +4,19 @@ add_library(${GEOM_LIB_NAME} STATIC
 
   voxel_data_structures.cu 
   voxel_data_structures.cpp
+  directional_tsdf.cu
   streamer.cu
   streamer.cpp
 
-  mesh_extractor.cpp
-  mesh_extractor.cu
-  marching_cubes.cu
-
-  gaussian_data_structures.cu
-  gaussian_data_structures.cpp
-
-  #madtree stuff
-  surface_normal_estimator/mad_tree.cpp
 )
 
 target_include_directories(${GEOM_LIB_NAME} PUBLIC
-  ${PROJECT_SOURCE_DIR}/src/gs/
-  ${eigen_SOURCE_DIR}
+  ${PROJECT_SOURCE_DIR}/src/sdf
   ${GTEST_INCLUDE_DIR}
 )
 
 target_link_libraries(${GEOM_LIB_NAME}
   PUBLIC
-    ${GS_LIB_NAME}
     ${OpenCV_LIBS}
     CUDA::cudart
     Eigen3::Eigen

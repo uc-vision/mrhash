@@ -1,9 +1,97 @@
 #include "streamer.cuh"
 #include "utils/point_cloud_serializer.h"
+#include <cmath>
 #include <unordered_set>
 
 namespace cupanutils {
   namespace cugeoutils {
+
+    namespace {
+
+      bool blockInCameraFrustum(const SDFBlockDesc& description,
+                                const float voxel_size,
+                                const Camera& camera,
+                                const Eigen::Isometry3f& camera_in_world) {
+        const Eigen::Isometry3f world_in_camera = camera_in_world.inverse();
+        for (int z : {0, static_cast<int>(sdf_block_size - 1)}) {
+          for (int y : {0, static_cast<int>(sdf_block_size - 1)}) {
+            for (int x : {0, static_cast<int>(sdf_block_size - 1)}) {
+              const Eigen::Vector3f voxel =
+                (CUDA2Eig(description.pos) * sdf_block_size + Eigen::Vector3i(x, y, z)).cast<float>();
+              const Eigen::Vector3f point = world_in_camera * (voxel_size * voxel);
+              float row;
+              float column;
+              if (camera.model() == Pinhole) {
+                if (point.z() <= camera.minDepth() || point.z() > camera.maxDepth())
+                  continue;
+                row = camera.fy() * point.y() / point.z() + camera.cy() + 0.5f;
+                column = camera.fx() * point.x() / point.z() + camera.cx() + 0.5f;
+              } else {
+                const float range = point.norm();
+                if (range < camera.minDepth() || range > camera.maxDepth())
+                  continue;
+                row = camera.fy() * std::asin(point.z() / range) + camera.cy() + 0.5f;
+                column = camera.fx() * std::atan2(point.y(), point.x()) + camera.cx() + 0.5f;
+              }
+              if (row >= 0.f && column >= 0.f && row < camera.rows() && column < camera.cols())
+                return true;
+            }
+          }
+        }
+        return false;
+      }
+
+      bool blockInDepthBand(const SDFBlockDesc& description,
+                            const float voxel_size,
+                            const Camera& camera,
+                            const Eigen::Isometry3f& camera_in_world,
+                            const std::vector<float>& depth,
+                            const int row_begin,
+                            const int row_end) {
+        const Eigen::Isometry3f world_in_camera = camera_in_world.inverse();
+        const float band =
+          (directional_truncation_voxels + 1.7320508075688772f * (sdf_block_size - 1)) * voxel_size;
+        for (int z_index = 0; z_index < 3; ++z_index) {
+          for (int y_index = 0; y_index < 3; ++y_index) {
+            for (int x_index = 0; x_index < 3; ++x_index) {
+              const Eigen::Vector3i offset(x_index * (sdf_block_size - 1) / 2,
+                                           y_index * (sdf_block_size - 1) / 2,
+                                           z_index * (sdf_block_size - 1) / 2);
+              const Eigen::Vector3f voxel =
+                (CUDA2Eig(description.pos) * sdf_block_size + offset).cast<float>();
+              const Eigen::Vector3f point = world_in_camera * (voxel_size * voxel);
+              float point_depth;
+              int row;
+              int column;
+              if (camera.model() == Pinhole) {
+                point_depth = point.z();
+                if (point_depth <= camera.minDepth() || point_depth > camera.maxDepth())
+                  continue;
+                row = static_cast<int>(camera.fy() * point.y() / point_depth + camera.cy() + 0.5f);
+                column = static_cast<int>(camera.fx() * point.x() / point_depth + camera.cx() + 0.5f);
+              } else {
+                point_depth = point.norm();
+                if (point_depth < camera.minDepth() || point_depth > camera.maxDepth())
+                  continue;
+                row = static_cast<int>(camera.fy() * std::asin(point.z() / point_depth) + camera.cy() + 0.5f);
+                column = static_cast<int>(camera.fx() * std::atan2(point.y(), point.x()) + camera.cx() + 0.5f);
+              }
+              if (row < 0 || column < 0 || row >= static_cast<int>(camera.rows()) ||
+                  column >= static_cast<int>(camera.cols()))
+                continue;
+              if (row < row_begin || row >= row_end)
+                continue;
+              const float measured_depth = depth[row * camera.cols() + column];
+              if (measured_depth >= camera.minDepth() && measured_depth <= camera.maxDepth() &&
+                  std::abs(point_depth - measured_depth) <= band)
+                return true;
+            }
+          }
+        }
+        return false;
+      }
+
+    } // namespace
 
     template <typename T>
     void
@@ -276,6 +364,83 @@ namespace cupanutils {
     }
 
     template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::streamOutToHostPass0(const Camera& camera) {
+      const uint num_pass = (container_->total_size_ + max_num_sdf_block_integrate_from_global_hash_ - 1) /
+                            max_num_sdf_block_integrate_from_global_hash_;
+      uint streamed_out_blocks = 0;
+      for (int pass = 0; pass < num_pass; ++pass) {
+        container_->resetHashBucketMutex();
+        clearSDFBlockCounter();
+        integrateFromGlobalHashPass1(camera, pass);
+        curr_stream_out_blocks_ = getSDFBlockCounter();
+        if (curr_stream_out_blocks_ == 0)
+          continue;
+        integrateFromGlobalHashPass2(curr_stream_out_blocks_, pass);
+        CUDA_CHECK(cudaMemcpy(h_SDFBlockDescOutput_,
+                              d_SDFBlockDescOutput_,
+                              sizeof(SDFBlockDesc) * curr_stream_out_blocks_,
+                              cudaMemcpyDeviceToHost));
+        if (compact_host_voxels_) {
+          CUDA_CHECK(cudaMemcpy(h_compact_voxel_output_,
+                                d_compact_voxel_output_,
+                                sizeof(CompactVoxel) * container_->voxel_block_volume_ * curr_stream_out_blocks_,
+                                cudaMemcpyDeviceToHost));
+          integrateCompactInChunkGrid(h_SDFBlockDescOutput_, h_compact_voxel_output_);
+        } else {
+          CUDA_CHECK(cudaMemcpy(h_SDFBlockOutput_,
+                                d_SDFBlockOutput_,
+                                sizeof(T) * container_->voxel_block_volume_ * curr_stream_out_blocks_,
+                                cudaMemcpyDeviceToHost));
+          integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
+        }
+        streamed_out_blocks += curr_stream_out_blocks_;
+      }
+      curr_stream_out_blocks_ = streamed_out_blocks;
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::streamOutToHostPass0(
+      const Camera& camera, const CUDAMatrixf& depth) {
+      streamOutToHostPass0(camera, depth, 0, depth.rows());
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::streamOutToHostPass0(
+      const Camera& camera, const CUDAMatrixf& depth, const int row_begin, const int row_end) {
+      const uint pass_count = (container_->total_size_ + max_num_sdf_block_integrate_from_global_hash_ - 1) /
+                              max_num_sdf_block_integrate_from_global_hash_;
+      uint streamed_out_blocks = 0;
+      for (uint pass = 0; pass < pass_count; ++pass) {
+        container_->resetHashBucketMutex();
+        clearSDFBlockCounter();
+        integrateFromGlobalHashPass1(camera, depth, row_begin, row_end, pass);
+        curr_stream_out_blocks_ = getSDFBlockCounter();
+        if (curr_stream_out_blocks_ == 0)
+          continue;
+        integrateFromGlobalHashPass2(curr_stream_out_blocks_, pass);
+        CUDA_CHECK(cudaMemcpy(h_SDFBlockDescOutput_,
+                              d_SDFBlockDescOutput_,
+                              sizeof(SDFBlockDesc) * curr_stream_out_blocks_,
+                              cudaMemcpyDeviceToHost));
+        if (compact_host_voxels_) {
+          CUDA_CHECK(cudaMemcpy(h_compact_voxel_output_,
+                                d_compact_voxel_output_,
+                                sizeof(CompactVoxel) * total_sdf_block_size * curr_stream_out_blocks_,
+                                cudaMemcpyDeviceToHost));
+          integrateCompactInChunkGrid(h_SDFBlockDescOutput_, h_compact_voxel_output_);
+        } else {
+          CUDA_CHECK(cudaMemcpy(h_SDFBlockOutput_,
+                                d_SDFBlockOutput_,
+                                sizeof(T) * total_sdf_block_size * curr_stream_out_blocks_,
+                                cudaMemcpyDeviceToHost));
+          integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
+        }
+        streamed_out_blocks += curr_stream_out_blocks_;
+      }
+      curr_stream_out_blocks_ = streamed_out_blocks;
+    }
+
+    template <typename T>
     void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::streamOutToCPUPass1CPU() {
       if (curr_stream_out_blocks_ > 0) {
         if (compact_host_voxels_)
@@ -356,43 +521,96 @@ namespace cupanutils {
     }
 
     template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::mergeResidentBlocksFromHost() {
+      container_->flatAndReduceHashTable();
+      std::vector<HashEntry> resident(container_->current_occupied_blocks_);
+      CUDA_CHECK(cudaMemcpy(resident.data(),
+                            container_->d_compactHashTable_,
+                            sizeof(HashEntry) * resident.size(),
+                            cudaMemcpyDeviceToHost));
+      uint batch_size = 0;
+      const auto merge_batch = [&]() {
+        if (batch_size == 0)
+          return;
+        CUDA_CHECK(cudaMemcpy(d_SDFBlockDescInput_,
+                              h_SDFBlockDescOutput_,
+                              sizeof(SDFBlockDesc) * batch_size,
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_SDFBlockInput_,
+                              h_SDFBlockOutput_,
+                              sizeof(T) * total_sdf_block_size * batch_size,
+                              cudaMemcpyHostToDevice));
+        uint heap_count;
+        CUDA_CHECK(cudaMemcpy(
+          &heap_count, container_->d_heapCounterHigh_, sizeof(uint), cudaMemcpyDeviceToHost));
+        chunkToGlobalHashPass1(
+          batch_size, heap_count, d_SDFBlockDescInput_, d_blocks_ptr_, d_merge_blocks_);
+        chunkToGlobalHashPass2(
+          batch_size,
+          heap_count,
+          d_SDFBlockDescInput_,
+          d_SDFBlockInput_,
+          d_blocks_ptr_,
+          d_merge_blocks_);
+        batch_size = 0;
+      };
+      for (const HashEntry& entry : resident) {
+        const Eigen::Vector3f world =
+          CUDA2Eig(entry.pos).cast<float>() * sdf_block_size * container_->virtual_voxel_size_;
+        const auto chunk = grid_.find(worldToChunks(world));
+        if (chunk == grid_.end())
+          continue;
+        const SDFBlockDesc description(entry);
+        const int block_index = chunk->second->findSDFBlock(description);
+        if (block_index < 0)
+          continue;
+        h_SDFBlockDescOutput_[batch_size] = description;
+        chunk->second->copySDFBlock(
+          block_index, h_SDFBlockOutput_ + batch_size * total_sdf_block_size);
+        chunk->second->removeSDFBlock(block_index);
+        ++batch_size;
+        if (batch_size == max_num_sdf_block_integrate_from_global_hash_)
+          merge_batch();
+      }
+      merge_batch();
+    }
+
+    template <typename T>
     void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::streamAllOut() {
       const uint num_pass = (container_->total_size_ + max_num_sdf_block_integrate_from_global_hash_ - 1) /
                             max_num_sdf_block_integrate_from_global_hash_;
-      uint streamed_out_blocks = 0;
       for (int pass = 0; pass < num_pass; ++pass) {
-        container_->resetHashBucketMutex();
-        clearSDFBlockCounter();
-        CUDA_CHECK(cudaEventRecord(start_event_, 0));
-        integrateFromGlobalHashPass1(pass);
-        curr_stream_out_blocks_ = getSDFBlockCounter();
+          container_->resetHashBucketMutex();
+          clearSDFBlockCounter();
+          CUDA_CHECK(cudaEventRecord(start_event_, 0));
+          integrateFromGlobalHashPass1(pass);
+          curr_stream_out_blocks_ = getSDFBlockCounter();
 
-        if (curr_stream_out_blocks_ > 0) {
-          integrateFromGlobalHashPass2(curr_stream_out_blocks_, pass);
+          if (curr_stream_out_blocks_ > 0) {
+            integrateFromGlobalHashPass2(curr_stream_out_blocks_, pass);
 
-          const int stream_size = curr_stream_out_blocks_;
-          CUDA_CHECK(cudaMemcpy(
-            &h_SDFBlockDescOutput_[0], &d_SDFBlockDescOutput_[0], sizeof(SDFBlockDesc) * stream_size, cudaMemcpyDeviceToHost));
-          if (compact_host_voxels_) {
-            CUDA_CHECK(cudaMemcpy(h_compact_voxel_output_,
-                                  d_compact_voxel_output_,
-                                  sizeof(CompactVoxel) * container_->voxel_block_volume_ * stream_size,
-                                  cudaMemcpyDeviceToHost));
-          } else {
-            CUDA_CHECK(cudaMemcpy(h_SDFBlockOutput_,
-                                  d_SDFBlockOutput_,
-                                  sizeof(T) * container_->voxel_block_volume_ * stream_size,
-                                  cudaMemcpyDeviceToHost));
+            const int stream_size = curr_stream_out_blocks_;
+            CUDA_CHECK(cudaMemcpy(
+              &h_SDFBlockDescOutput_[0], &d_SDFBlockDescOutput_[0], sizeof(SDFBlockDesc) * stream_size, cudaMemcpyDeviceToHost));
+            if (compact_host_voxels_) {
+              CUDA_CHECK(cudaMemcpy(h_compact_voxel_output_,
+                                    d_compact_voxel_output_,
+                                    sizeof(CompactVoxel) * container_->voxel_block_volume_ * stream_size,
+                                    cudaMemcpyDeviceToHost));
+            } else {
+              CUDA_CHECK(cudaMemcpy(h_SDFBlockOutput_,
+                                    d_SDFBlockOutput_,
+                                    sizeof(T) * container_->voxel_block_volume_ * stream_size,
+                                    cudaMemcpyDeviceToHost));
+            }
+            CUDA_CHECK(cudaEventRecord(stop_event_, 0));
+            CUDA_CHECK(cudaEventSynchronize(stop_event_));
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start_event_, stop_event_));
+            if (compact_host_voxels_)
+              integrateCompactInChunkGrid(h_SDFBlockDescOutput_, h_compact_voxel_output_);
+            else
+              integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
           }
-          CUDA_CHECK(cudaEventRecord(stop_event_, 0));
-          CUDA_CHECK(cudaEventSynchronize(stop_event_));
-          CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start_event_, stop_event_));
-          if (compact_host_voxels_)
-            integrateCompactInChunkGrid(h_SDFBlockDescOutput_, h_compact_voxel_output_);
-          else
-            integrateInChunkGrid(h_SDFBlockDescOutput_, h_SDFBlockOutput_);
-          streamed_out_blocks += curr_stream_out_blocks_;
-        }
       }
     }
 
@@ -413,13 +631,18 @@ namespace cupanutils {
       uint num_SDF_blocks = 0;
       uint copied_voxels  = 0;
       stream_in_done_     = true;
+      const uint import_capacity = std::min(
+        max_num_sdf_block_integrate_from_global_hash_,
+        static_cast<uint>(container_->getHeapHighFreeCount()));
+      if (import_capacity == 0)
+        return 0;
 
       for (auto& [chunk_pos, chunk_ptr] : grid_) {
         if (!isChunkInSphere(chunk_pos, camera_pose, radius))
           continue;
 
         const uint num_blocks = chunk_ptr->getNElements();
-        const uint available = max_num_sdf_block_integrate_from_global_hash_ - num_SDF_blocks;
+        const uint available = import_capacity - num_SDF_blocks;
         const uint copy_count = std::min(num_blocks, available);
         for (uint i = 0; i < copy_count; ++i) {
           const uint chunk_index = num_blocks - copy_count + i;
@@ -439,7 +662,7 @@ namespace cupanutils {
         }
         chunk_ptr->removeLastSDFBlocks(copy_count);
         num_SDF_blocks += copy_count;
-        if (num_SDF_blocks == max_num_sdf_block_integrate_from_global_hash_) {
+        if (num_SDF_blocks == import_capacity) {
           stream_in_done_ = false;
           break;
         }
@@ -463,6 +686,135 @@ namespace cupanutils {
     }
 
     template <typename T>
+    uint Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrateInHash(
+      const Camera& camera, const Eigen::Isometry3f& camera_in_world) {
+      uint block_count = 0;
+      uint copied_voxels = 0;
+      stream_in_done_ = true;
+      const uint import_capacity = std::min(
+        max_num_sdf_block_integrate_from_global_hash_,
+        static_cast<uint>(container_->getHeapHighFreeCount()));
+      if (import_capacity == 0)
+        return 0;
+      for (auto& grid_entry : grid_) {
+        auto& chunk = grid_entry.second;
+        uint block_index = 0;
+        while (block_index < chunk->getNElements()) {
+          const SDFBlockDesc& description = chunk->getSDFBlockDesc(block_index);
+          if (!blockInCameraFrustum(description, container_->virtual_voxel_size_, camera, camera_in_world)) {
+            ++block_index;
+            continue;
+          }
+          h_SDFBlockDescOutput_[block_count] = description;
+          const int scale = 1 << (finest_block_log2_dim - description.resolution);
+          const int voxel_count = scale * scale * scale;
+          if (compact_host_voxels_)
+            chunk->copyCompactSDFBlock(
+              block_index, h_compact_voxel_output_ + block_count * total_sdf_block_size);
+          else
+            chunk->copySDFBlock(block_index, h_SDFBlockOutput_ + copied_voxels);
+          copied_voxels += voxel_count;
+          ++block_count;
+          chunk->removeSDFBlock(block_index);
+          if (block_count == import_capacity) {
+            stream_in_done_ = false;
+            break;
+          }
+        }
+        if (!stream_in_done_)
+          break;
+      }
+      CUDA_CHECK(cudaMemcpy(d_SDFBlockDescInput_,
+                            h_SDFBlockDescOutput_,
+                            sizeof(SDFBlockDesc) * block_count,
+                            cudaMemcpyHostToDevice));
+      if (compact_host_voxels_) {
+        CUDA_CHECK(cudaMemcpy(d_compact_voxel_input_,
+                              h_compact_voxel_output_,
+                              sizeof(CompactVoxel) * total_sdf_block_size * block_count,
+                              cudaMemcpyHostToDevice));
+      } else {
+        CUDA_CHECK(cudaMemcpy(
+          d_SDFBlockInput_, h_SDFBlockOutput_, sizeof(T) * copied_voxels, cudaMemcpyHostToDevice));
+      }
+      return block_count;
+    }
+
+    template <typename T>
+    uint Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrateInHash(
+      const Camera& camera,
+      const Eigen::Isometry3f& camera_in_world,
+      const std::vector<float>& depth) {
+      return integrateInHash(camera, camera_in_world, depth, 0, camera.rows());
+    }
+
+    template <typename T>
+    uint Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::integrateInHash(
+      const Camera& camera,
+      const Eigen::Isometry3f& camera_in_world,
+      const std::vector<float>& depth,
+      const int row_begin,
+      const int row_end) {
+      uint block_count = 0;
+      uint copied_voxels = 0;
+      stream_in_done_ = true;
+      const uint import_capacity = std::min(
+        max_num_sdf_block_integrate_from_global_hash_,
+        static_cast<uint>(container_->getHeapHighFreeCount()));
+      if (import_capacity == 0)
+        return 0;
+      for (auto& grid_entry : grid_) {
+        auto& chunk = grid_entry.second;
+        uint block_index = 0;
+        while (block_index < chunk->getNElements()) {
+          const SDFBlockDesc& description = chunk->getSDFBlockDesc(block_index);
+          if (!blockInDepthBand(
+                description,
+                container_->virtual_voxel_size_,
+                camera,
+                camera_in_world,
+                depth,
+                row_begin,
+                row_end)) {
+            ++block_index;
+            continue;
+          }
+          h_SDFBlockDescOutput_[block_count] = description;
+          const int scale = 1 << (finest_block_log2_dim - description.resolution);
+          const int voxel_count = scale * scale * scale;
+          if (compact_host_voxels_)
+            chunk->copyCompactSDFBlock(
+              block_index, h_compact_voxel_output_ + block_count * total_sdf_block_size);
+          else
+            chunk->copySDFBlock(block_index, h_SDFBlockOutput_ + copied_voxels);
+          copied_voxels += voxel_count;
+          ++block_count;
+          chunk->removeSDFBlock(block_index);
+          if (block_count == import_capacity) {
+            stream_in_done_ = false;
+            break;
+          }
+        }
+        if (!stream_in_done_)
+          break;
+      }
+      CUDA_CHECK(cudaMemcpy(d_SDFBlockDescInput_,
+                            h_SDFBlockDescOutput_,
+                            sizeof(SDFBlockDesc) * block_count,
+                            cudaMemcpyHostToDevice));
+      if (compact_host_voxels_) {
+        CUDA_CHECK(cudaMemcpy(d_compact_voxel_input_,
+                              h_compact_voxel_output_,
+                              sizeof(CompactVoxel) * total_sdf_block_size * block_count,
+                              cudaMemcpyHostToDevice));
+      } else {
+        CUDA_CHECK(cudaMemcpy(
+          d_SDFBlockInput_, h_SDFBlockOutput_, sizeof(T) * copied_voxels, cudaMemcpyHostToDevice));
+      }
+      return block_count;
+    }
+
+    template <typename T>
     void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::stream(const Eigen::Vector3f& camera_position,
                                                                            const float radius) {
       {
@@ -479,6 +831,49 @@ namespace cupanutils {
         // stream - in in GPU
         streamInToGPU(camera_position, radius);
       }
+      streaming_profiler_.write(curr_stream_in_blocks_ + curr_stream_out_blocks_);
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::stream(
+      const Camera& camera, const Eigen::Isometry3f& camera_in_world) {
+      CUDAProfiler::CUDAEvent event(streaming_profiler_);
+      CUDA_CHECK(cudaEventRecord(start_event_, 0));
+      streamOutToHostPass0(camera);
+      CUDA_CHECK(cudaEventRecord(stop_event_, 0));
+      CUDA_CHECK(cudaEventSynchronize(stop_event_));
+      CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start_event_, stop_event_));
+      streamInToGPU(camera, camera_in_world);
+      streaming_profiler_.write(curr_stream_in_blocks_ + curr_stream_out_blocks_);
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::stream(
+      const Camera& camera,
+      const Eigen::Isometry3f& camera_in_world,
+      const CUDAMatrixf& depth) {
+      stream(camera, camera_in_world, depth, 0, depth.rows());
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::stream(
+      const Camera& camera,
+      const Eigen::Isometry3f& camera_in_world,
+      const CUDAMatrixf& depth,
+      const int row_begin,
+      const int row_end) {
+      std::vector<float> depth_values(depth.rows() * depth.cols());
+      CUDA_CHECK(cudaMemcpy(depth_values.data(),
+                            depth.data<Device>(),
+                            sizeof(float) * depth_values.size(),
+                            cudaMemcpyDeviceToHost));
+      CUDAProfiler::CUDAEvent event(streaming_profiler_);
+      CUDA_CHECK(cudaEventRecord(start_event_, 0));
+      streamOutToHostPass0(camera, depth, row_begin, row_end);
+      CUDA_CHECK(cudaEventRecord(stop_event_, 0));
+      CUDA_CHECK(cudaEventSynchronize(stop_event_));
+      CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start_event_, stop_event_));
+      streamInToGPU(camera, camera_in_world, depth_values, row_begin, row_end);
       streaming_profiler_.write(curr_stream_in_blocks_ + curr_stream_out_blocks_);
     }
 
@@ -504,6 +899,77 @@ namespace cupanutils {
               curr_stream_in_blocks_, heap_count_prev, d_SDFBlockDescInput_, d_SDFBlockInput_, d_blocks_ptr_, d_merge_blocks_);
           }
         }
+        if (!stream_in_done_ && container_->getHeapHighFreeCount() == 0)
+          break;
+      } while (!stream_in_done_);
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::streamInToGPU(
+      const Camera& camera, const Eigen::Isometry3f& camera_in_world) {
+      do {
+        curr_stream_in_blocks_ = integrateInHash(camera, camera_in_world);
+        if (curr_stream_in_blocks_ == 0)
+          continue;
+        uint heap_count_previous;
+        CUDA_CHECK(cudaMemcpy(
+          &heap_count_previous, container_->d_heapCounterHigh_, sizeof(uint), cudaMemcpyDeviceToHost));
+        chunkToGlobalHashPass1(
+          curr_stream_in_blocks_, heap_count_previous, d_SDFBlockDescInput_, d_blocks_ptr_, d_merge_blocks_);
+        if (compact_host_voxels_) {
+          chunkToGlobalHashPass2Compact(
+            curr_stream_in_blocks_, d_SDFBlockDescInput_, d_compact_voxel_input_, d_blocks_ptr_, d_merge_blocks_);
+        } else {
+          chunkToGlobalHashPass2(curr_stream_in_blocks_,
+                                 heap_count_previous,
+                                 d_SDFBlockDescInput_,
+                                 d_SDFBlockInput_,
+                                 d_blocks_ptr_,
+                                 d_merge_blocks_);
+        }
+        if (!stream_in_done_ && container_->getHeapHighFreeCount() == 0)
+          break;
+      } while (!stream_in_done_);
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::streamInToGPU(
+      const Camera& camera,
+      const Eigen::Isometry3f& camera_in_world,
+      const std::vector<float>& depth) {
+      streamInToGPU(camera, camera_in_world, depth, 0, camera.rows());
+    }
+
+    template <typename T>
+    void Streamer<T, std::enable_if_t<is_voxel_derived<T>::value>>::streamInToGPU(
+      const Camera& camera,
+      const Eigen::Isometry3f& camera_in_world,
+      const std::vector<float>& depth,
+      const int row_begin,
+      const int row_end) {
+      do {
+        curr_stream_in_blocks_ = integrateInHash(
+          camera, camera_in_world, depth, row_begin, row_end);
+        if (curr_stream_in_blocks_ == 0)
+          continue;
+        uint heap_count_previous;
+        CUDA_CHECK(cudaMemcpy(
+          &heap_count_previous, container_->d_heapCounterHigh_, sizeof(uint), cudaMemcpyDeviceToHost));
+        chunkToGlobalHashPass1(
+          curr_stream_in_blocks_, heap_count_previous, d_SDFBlockDescInput_, d_blocks_ptr_, d_merge_blocks_);
+        if (compact_host_voxels_) {
+          chunkToGlobalHashPass2Compact(
+            curr_stream_in_blocks_, d_SDFBlockDescInput_, d_compact_voxel_input_, d_blocks_ptr_, d_merge_blocks_);
+        } else {
+          chunkToGlobalHashPass2(curr_stream_in_blocks_,
+                                 heap_count_previous,
+                                 d_SDFBlockDescInput_,
+                                 d_SDFBlockInput_,
+                                 d_blocks_ptr_,
+                                 d_merge_blocks_);
+        }
+        if (!stream_in_done_ && container_->getHeapHighFreeCount() == 0)
+          break;
       } while (!stream_in_done_);
     }
 

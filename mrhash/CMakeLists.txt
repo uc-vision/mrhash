@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
 
 if(POLICY CMP0146)
   cmake_policy(SET CMP0146 OLD)
@@ -17,7 +17,6 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 17)
 
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
-option(MRHASH_BUILD_APPS "Build mrhash example applications" OFF)
 option(MRHASH_BUILD_TESTS "Build mrhash C++/CUDA tests" OFF)
 
 macro(mrhash_reset_findcuda_cache)
@@ -217,27 +216,14 @@ FetchContent_Declare(
   eigen
   GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
   GIT_TAG 3.4.0
+  EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(eigen)
-message(STATUS "Eigen Include Directories: ${eigen_SOURCE_DIR}")
-
-FetchContent_Declare(
-  nanobind
-  GIT_REPOSITORY https://github.com/wjakob/nanobind.git
-  GIT_TAG v2.7.0
-)
-FetchContent_MakeAvailable(nanobind)
 
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
   OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT)
-
-FetchContent_Declare(
-  yaml-cpp
-  GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
-  # GIT_TAG yaml-cpp-0.8.0 # Can be a tag (yaml-cpp-x.x.x), a commit hash, or a branch name (master)
-)
-FetchContent_MakeAvailable(yaml-cpp)
+find_package(nanobind CONFIG REQUIRED)
 
 # Libigl
 # list(PREPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
@@ -245,42 +231,11 @@ FetchContent_MakeAvailable(yaml-cpp)
 # include(libigl)
 # igl_include(core)
 
-# OpenMP
-find_package(OpenMP REQUIRED COMPONENTS CXX)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-
-# Torch setup
-# find_package(Torch REQUIRED)
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
-# Define the absolute path to LibTorch
-get_filename_component(PROJ_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}" ABSOLUTE)
-set(LIBTORCH_DIR "${PROJ_ROOT_DIR}/third_party/libtorch")
-list(APPEND CMAKE_PREFIX_PATH ${LIBTORCH_DIR})
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
-find_package(Torch REQUIRED)
-if(DEFINED ENV{CONDA_PREFIX} AND TARGET torch)
-  get_target_property(MRHASH_TORCH_INCLUDE_DIRS torch INTERFACE_INCLUDE_DIRECTORIES)
-  if(MRHASH_TORCH_INCLUDE_DIRS)
-    list(FILTER MRHASH_TORCH_INCLUDE_DIRS EXCLUDE REGEX "site-packages/torch/include")
-  endif()
-  list(APPEND MRHASH_TORCH_INCLUDE_DIRS "$ENV{CONDA_PREFIX}/include")
-  list(APPEND MRHASH_TORCH_INCLUDE_DIRS "$ENV{CONDA_PREFIX}/include/torch/csrc/api/include")
-  set_target_properties(torch PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${MRHASH_TORCH_INCLUDE_DIRS}")
-endif()
-set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-set(CMAKE_INSTALL_RPATH "${LIBTORCH_DIR}/lib")
-
-add_subdirectory(third_party)
-
 set(GEOM_LIB_NAME "libgeometric")
-set(GS_LIB_NAME "libgsmodel")
 
 add_subdirectory(src)
 if(MRHASH_BUILD_TESTS)
   find_package(GTest REQUIRED)
   add_subdirectory(tests)
   enable_testing()
-endif()
-if(MRHASH_BUILD_APPS)
-  add_subdirectory(apps)
 endif()
